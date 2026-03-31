@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
@@ -44,14 +46,12 @@ type persistedTrie struct {
 }
 
 // kvCacheDir returns the directory for persisting KV cache for a given model,
-// creating it if necessary. The path is ~/.ollama/cache/kv/<sanitized-digest>/.
+// creating it if necessary. The base is derived from envconfig.Models() so it
+// respects OLLAMA_MODELS overrides (e.g. <models-parent>/cache/kv/<digest>/).
 func kvCacheDir(modelDigest string) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
-	}
+	base := filepath.Dir(envconfig.Models()) // e.g. ~/.ollama
 	digest := strings.ReplaceAll(modelDigest, ":", "-")
-	dir := filepath.Join(home, ".ollama", "cache", "kv", digest)
+	dir := filepath.Join(base, "cache", "kv", digest)
 	return dir, os.MkdirAll(dir, 0o700)
 }
 
@@ -100,11 +100,6 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 	}
 	slog.Debug("saving trie", "nodes", len(nodes), "layers", len(c.caches))
 
-	// Clean out any old node files before writing new ones.
-	if err := cleanNodeFiles(cacheDir); err != nil {
-		slog.Warn("failed to clean old cache files", "error", err)
-	}
-
 	persisted := persistedTrie{
 		Version:   trieFormatVersion,
 		ModelID:   modelID,
@@ -112,6 +107,9 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		SavedAt:   time.Now().UTC().Format(time.RFC3339),
 	}
 
+	// Write new node files first (overwriting any with matching indices).
+	// This avoids a crash-vulnerability window where old files are deleted
+	// but new ones haven't been written yet.
 	for i, node := range nodes {
 		pn := persistedNode{
 			Tokens:    node.tokens,
@@ -155,6 +153,8 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		persisted.Nodes = append(persisted.Nodes, pn)
 	}
 
+	// Write trie.json atomically, then clean up stale node files from a
+	// previous save that had more nodes than the current one.
 	data, err := json.Marshal(persisted)
 	if err != nil {
 		return fmt.Errorf("marshal trie: %w", err)
@@ -165,6 +165,8 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 	if err := atomicWriteFile(tmpPath, finalPath, data); err != nil {
 		return err
 	}
+
+	cleanStaleNodeFiles(cacheDir, len(nodes))
 
 	slog.Info("KV cache saved", "nodes", len(nodes), "dir", cacheDir)
 	return nil
@@ -301,20 +303,7 @@ func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.Snapsho
 	arrays := make(map[string]*mlx.Array)
 	meta := make(map[string]string)
 
-	// Determine which array names to look for based on type.
-	var arrayNames []string
-	var metaNames []string
-	switch snapType {
-	case cache.SnapshotTypeKV:
-		arrayNames = []string{"keys", "values"}
-		metaNames = []string{"from_offset", "to_offset"}
-	case cache.SnapshotTypeRotating:
-		arrayNames = []string{"keys", "values"}
-		metaNames = []string{"from_offset", "to_offset", "idx"}
-	case cache.SnapshotTypeRecurrent:
-		arrayNames = []string{"conv_state", "delta_state"}
-		metaNames = []string{"offset"}
-	}
+	arrayNames, metaNames := snapType.FieldNames()
 
 	for _, name := range arrayNames {
 		arr := sf.Get(prefix + name)
@@ -333,29 +322,47 @@ func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.Snapsho
 	return arrays, meta
 }
 
-// cleanNodeFiles removes old node_*.safetensors files from the cache directory.
+// cleanStaleNodeFiles removes node_*.safetensors files with indices >= nodeCount.
+// These are leftovers from a previous save that had more nodes than the current one.
 // Best-effort: logs and continues on individual removal failures.
-func cleanNodeFiles(dir string) error {
+func cleanStaleNodeFiles(dir string, nodeCount int) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return err
+		return
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), nodeFilePrefix) && strings.HasSuffix(e.Name(), nodeFileSuffix) {
-			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
-				slog.Warn("failed to remove old cache file", "file", e.Name(), "error", err)
+		name := e.Name()
+		if !strings.HasPrefix(name, nodeFilePrefix) || !strings.HasSuffix(name, nodeFileSuffix) {
+			continue
+		}
+		idxStr := strings.TrimPrefix(strings.TrimSuffix(name, nodeFileSuffix), nodeFilePrefix)
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil {
+			continue
+		}
+		if idx >= nodeCount {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+				slog.Warn("failed to remove stale cache file", "file", name, "error", err)
 			}
 		}
 	}
-	return nil
 }
 
 // atomicWriteFile writes data to tmpPath, fsyncs it, then renames to finalPath.
+// The tmp file is cleaned up on any error.
 func atomicWriteFile(tmpPath, finalPath string, data []byte) error {
 	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", tmpPath, err)
 	}
+
+	cleanup := true
+	defer func() {
+		if cleanup {
+			os.Remove(tmpPath)
+		}
+	}()
+
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return fmt.Errorf("write %s: %w", tmpPath, err)
@@ -370,5 +377,6 @@ func atomicWriteFile(tmpPath, finalPath string, data []byte) error {
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return fmt.Errorf("rename %s: %w", finalPath, err)
 	}
+	cleanup = false
 	return nil
 }

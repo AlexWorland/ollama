@@ -16,6 +16,22 @@ const (
 	SnapshotTypeRecurrent SnapshotType = "recurrent"
 )
 
+// FieldNames returns the expected array and metadata key names for this
+// snapshot type. This is the single source of truth for the serialization
+// schema — used by both export (save) and import (load) paths.
+func (t SnapshotType) FieldNames() (arrayNames, metaNames []string) {
+	switch t {
+	case SnapshotTypeKV:
+		return []string{"keys", "values"}, []string{"from_offset", "to_offset"}
+	case SnapshotTypeRotating:
+		return []string{"keys", "values"}, []string{"from_offset", "to_offset", "idx"}
+	case SnapshotTypeRecurrent:
+		return []string{"conv_state", "delta_state"}, []string{"offset"}
+	default:
+		return nil, nil
+	}
+}
+
 // SnapshotExport holds all data needed to reconstruct a snapshot from disk.
 type SnapshotExport struct {
 	Type     SnapshotType

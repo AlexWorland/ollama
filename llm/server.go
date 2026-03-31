@@ -1851,7 +1851,11 @@ func (s *llmServer) Close() error {
 		// if ProcessState is already populated, Wait already completed, no need to wait again
 		if s.cmd.ProcessState == nil {
 			slog.Debug("waiting for llama server to exit", "pid", s.Pid())
-			<-s.done
+			select {
+			case <-s.done:
+			case <-time.After(2 * time.Second):
+				slog.Warn("runner process did not exit after kill, abandoning wait", "pid", s.Pid())
+			}
 		}
 
 		slog.Debug("llama server stopped", "pid", s.Pid())
