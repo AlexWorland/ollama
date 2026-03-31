@@ -15,6 +15,15 @@ import (
 
 const trieFormatVersion = 1
 
+const (
+	nodeFilePrefix = "node_"
+	nodeFileSuffix = ".safetensors"
+)
+
+func nodeFileName(i int) string {
+	return fmt.Sprintf("%s%d%s", nodeFilePrefix, i, nodeFileSuffix)
+}
+
 // persistedNode is the JSON-serializable form of a trieNode.
 // The node's ID is its index in the persistedTrie.Nodes slice.
 type persistedNode struct {
@@ -108,35 +117,32 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 			User:      node.user,
 		}
 
-		// Record children IDs.
 		for _, child := range node.children {
 			pn.Children = append(pn.Children, nodeMap[child])
 		}
 
-		// Export and save snapshots.
 		if node.hasSnapshots() {
 			pn.SnapTypes = make([]string, len(c.caches))
 			arrays := make(map[string]*mlx.Array)
 			metadata := make(map[string]string)
 
-			for i, snap := range node.snapshots {
+			for li, snap := range node.snapshots {
 				exp := cache.ExportSnapshot(snap)
 				if exp == nil {
 					continue
 				}
-				pn.SnapTypes[i] = string(exp.Type)
+				pn.SnapTypes[li] = string(exp.Type)
 
-				// Prefix array names with layer index.
 				for name, arr := range exp.Arrays {
-					arrays[fmt.Sprintf("layer_%d_%s", i, name)] = arr
+					arrays[fmt.Sprintf("layer_%d_%s", li, name)] = arr
 				}
 				for key, val := range exp.Metadata {
-					metadata[fmt.Sprintf("layer_%d_%s", i, key)] = val
+					metadata[fmt.Sprintf("layer_%d_%s", li, key)] = val
 				}
 			}
 
 			if len(arrays) > 0 {
-				path := filepath.Join(cacheDir, fmt.Sprintf("node_%d.safetensors", i))
+				path := filepath.Join(cacheDir, nodeFileName(i))
 				if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
 					return fmt.Errorf("save node %d: %w", i, err)
 				}
@@ -146,8 +152,7 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		persisted.Nodes = append(persisted.Nodes, pn)
 	}
 
-	// Write trie.json atomically: write to tmp, fsync, then rename.
-	data, err := json.MarshalIndent(persisted, "", "  ")
+	data, err := json.Marshal(persisted)
 	if err != nil {
 		return fmt.Errorf("marshal trie: %w", err)
 	}
@@ -226,7 +231,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 			continue
 		}
 
-		nodePath := filepath.Join(cacheDir, fmt.Sprintf("node_%d.safetensors", i))
+		nodePath := filepath.Join(cacheDir, nodeFileName(i))
 		sf, err := mlx.LoadSafetensorsNative(nodePath)
 		if err != nil {
 			slog.Warn("failed to load node snapshot, skipping", "node", i, "error", err)
@@ -329,7 +334,7 @@ func cleanNodeFiles(dir string) error {
 		return err
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "node_") && strings.HasSuffix(e.Name(), ".safetensors") {
+		if strings.HasPrefix(e.Name(), nodeFilePrefix) && strings.HasSuffix(e.Name(), nodeFileSuffix) {
 			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
 				slog.Warn("failed to remove old cache file", "file", e.Name(), "error", err)
 			}
