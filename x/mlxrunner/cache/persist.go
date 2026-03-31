@@ -75,23 +75,6 @@ func ExportSnapshot(s Snapshot) *SnapshotExport {
 	}
 }
 
-// SnapshotType returns the type of a snapshot without exporting its data.
-func TypeOf(s Snapshot) SnapshotType {
-	if s == nil {
-		return ""
-	}
-	switch s.(type) {
-	case *kvSnapshot:
-		return SnapshotTypeKV
-	case *rotatingSnapshot:
-		return SnapshotTypeRotating
-	case *recurrentSnapshot:
-		return SnapshotTypeRecurrent
-	default:
-		return ""
-	}
-}
-
 // ImportSnapshot reconstructs a Snapshot from loaded arrays and metadata.
 // The caller must have already loaded the arrays from a safetensors file.
 // Imported arrays are pinned and async-evaluated to match the state

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
@@ -17,8 +16,8 @@ import (
 const trieFormatVersion = 1
 
 // persistedNode is the JSON-serializable form of a trieNode.
+// The node's ID is its index in the persistedTrie.Nodes slice.
 type persistedNode struct {
-	ID        int      `json:"id"`
 	Tokens    []int32  `json:"tokens"`
 	EndOffset int      `json:"end_offset"`
 	User      bool     `json:"user,omitempty"`
@@ -38,10 +37,12 @@ type persistedTrie struct {
 // kvCacheDir returns the directory for persisting KV cache for a given model,
 // creating it if necessary. The path is ~/.ollama/cache/kv/<sanitized-digest>/.
 func kvCacheDir(modelDigest string) (string, error) {
-	// Models() returns ~/.ollama/models; go one level up for ~/.ollama/
-	base := filepath.Dir(envconfig.Models())
-	digest := strings.Replace(modelDigest, ":", "-", 1)
-	dir := filepath.Join(base, "cache", "kv", digest)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	digest := strings.ReplaceAll(modelDigest, ":", "-")
+	dir := filepath.Join(home, ".ollama", "cache", "kv", digest)
 	return dir, os.MkdirAll(dir, 0o700)
 }
 
@@ -100,10 +101,8 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		SavedAt:   time.Now().UTC().Format(time.RFC3339),
 	}
 
-	for _, node := range nodes {
-		id := nodeMap[node]
+	for i, node := range nodes {
 		pn := persistedNode{
-			ID:        id,
 			Tokens:    node.tokens,
 			EndOffset: node.endOffset,
 			User:      node.user,
@@ -137,9 +136,9 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 			}
 
 			if len(arrays) > 0 {
-				path := filepath.Join(cacheDir, fmt.Sprintf("node_%d.safetensors", id))
+				path := filepath.Join(cacheDir, fmt.Sprintf("node_%d.safetensors", i))
 				if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
-					return fmt.Errorf("save node %d: %w", id, err)
+					return fmt.Errorf("save node %d: %w", i, err)
 				}
 			}
 		}
@@ -147,7 +146,7 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		persisted.Nodes = append(persisted.Nodes, pn)
 	}
 
-	// Write trie.json atomically.
+	// Write trie.json atomically: write to tmp, fsync, then rename.
 	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal trie: %w", err)
@@ -155,11 +154,8 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 
 	tmpPath := filepath.Join(cacheDir, "trie.json.tmp")
 	finalPath := filepath.Join(cacheDir, "trie.json")
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
-		return fmt.Errorf("write trie.json.tmp: %w", err)
-	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		return fmt.Errorf("rename trie.json: %w", err)
+	if err := atomicWriteFile(tmpPath, finalPath, data); err != nil {
+		return err
 	}
 
 	slog.Info("KV cache saved", "nodes", len(nodes), "dir", cacheDir)
@@ -230,10 +226,10 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 			continue
 		}
 
-		nodePath := filepath.Join(cacheDir, fmt.Sprintf("node_%d.safetensors", pn.ID))
+		nodePath := filepath.Join(cacheDir, fmt.Sprintf("node_%d.safetensors", i))
 		sf, err := mlx.LoadSafetensorsNative(nodePath)
 		if err != nil {
-			slog.Warn("failed to load node snapshot, skipping", "node", pn.ID, "error", err)
+			slog.Warn("failed to load node snapshot, skipping", "node", i, "error", err)
 			continue
 		}
 
@@ -249,14 +245,14 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 			snapType := cache.SnapshotType(pn.SnapTypes[layer])
 			arrays, meta := extractLayerData(sf, layer, snapType)
 			if len(arrays) == 0 {
-				slog.Warn("missing arrays for layer", "node", pn.ID, "layer", layer)
+				slog.Warn("missing arrays for layer", "node", i, "layer", layer)
 				allLoaded = false
 				continue
 			}
 
 			snap, err := cache.ImportSnapshot(snapType, arrays, meta)
 			if err != nil {
-				slog.Warn("failed to import snapshot", "node", pn.ID, "layer", layer, "error", err)
+				slog.Warn("failed to import snapshot", "node", i, "layer", layer, "error", err)
 				allLoaded = false
 				continue
 			}
@@ -326,6 +322,7 @@ func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.Snapsho
 }
 
 // cleanNodeFiles removes old node_*.safetensors files from the cache directory.
+// Best-effort: logs and continues on individual removal failures.
 func cleanNodeFiles(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -333,10 +330,33 @@ func cleanNodeFiles(dir string) error {
 	}
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), "node_") && strings.HasSuffix(e.Name(), ".safetensors") {
-			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
-				return err
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
+				slog.Warn("failed to remove old cache file", "file", e.Name(), "error", err)
 			}
 		}
+	}
+	return nil
+}
+
+// atomicWriteFile writes data to tmpPath, fsyncs it, then renames to finalPath.
+func atomicWriteFile(tmpPath, finalPath string, data []byte) error {
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", tmpPath, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("write %s: %w", tmpPath, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("fsync %s: %w", tmpPath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return fmt.Errorf("rename %s: %w", finalPath, err)
 	}
 	return nil
 }

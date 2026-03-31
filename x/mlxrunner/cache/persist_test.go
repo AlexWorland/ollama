@@ -151,20 +151,3 @@ func TestImportKVMissingArrays(t *testing.T) {
 	}
 }
 
-func TestTypeOf(t *testing.T) {
-	skipIfNoMLX(t)
-
-	kv := NewKVCache()
-	k := mlx.Zeros(mlx.DTypeFloat16, 1, 4, 1, 8)
-	v := mlx.Zeros(mlx.DTypeFloat16, 1, 4, 1, 8)
-	kv.Update(k, v)
-	snap := kv.Snapshot(0)
-	defer snap.Close()
-
-	if got := TypeOf(snap); got != SnapshotTypeKV {
-		t.Fatalf("expected kv, got %s", got)
-	}
-	if got := TypeOf(nil); got != "" {
-		t.Fatalf("expected empty, got %s", got)
-	}
-}
