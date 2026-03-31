@@ -66,6 +66,7 @@ func (c *kvCache) captureActiveFrontier() {
 		return
 	}
 	fromOffset := frontier.startOffset()
+	slog.Debug("capturing active frontier snapshot", "offset", fromOffset, "tokens", len(frontier.tokens))
 	snaps := make([]cache.Snapshot, len(c.caches))
 	for j, kv := range c.caches {
 		if kv == nil {
@@ -94,9 +95,10 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 	})
 
 	if len(nodes) <= 1 {
-		// Only root with no children — nothing worth saving.
+		slog.Debug("skipping trie save, only root node")
 		return nil
 	}
+	slog.Debug("saving trie", "nodes", len(nodes), "layers", len(c.caches))
 
 	// Clean out any old node files before writing new ones.
 	if err := cleanNodeFiles(cacheDir); err != nil {
@@ -143,6 +145,7 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 
 			if len(arrays) > 0 {
 				path := filepath.Join(cacheDir, nodeFileName(i))
+				slog.Debug("saving node snapshot", "node", i, "arrays", len(arrays))
 				if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
 					return fmt.Errorf("save node %d: %w", i, err)
 				}
@@ -171,8 +174,10 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 // no cache exists or the version/model doesn't match.
 func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error) {
 	triePath := filepath.Join(cacheDir, "trie.json")
+	slog.Debug("loading trie", "path", triePath)
 	data, err := os.ReadFile(triePath)
 	if os.IsNotExist(err) {
+		slog.Debug("no cached trie found")
 		return nil, 0, nil
 	}
 	if err != nil {
@@ -280,8 +285,10 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 
 		trieNodes[i].snapshots = snaps
 		pagedOutBytes += nodeBytes
+		slog.Debug("loaded node snapshot", "node", i, "bytes", nodeBytes)
 	}
 
+	slog.Debug("trie loaded", "nodes", len(trieNodes), "paged_out_bytes", pagedOutBytes)
 	root := trieNodes[0]
 	return root, pagedOutBytes, nil
 }
