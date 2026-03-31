@@ -50,6 +50,7 @@ type Runner struct {
 	Requests      chan Request
 	cache         kvCache
 	contextLength int
+	modelDigest   string // manifest config digest for cache keying
 }
 
 func (r *Runner) Load(modelName string) error {
@@ -79,6 +80,7 @@ func (r *Runner) Load(modelName string) error {
 	r.Model = m
 	r.Tokenizer = m.Tokenizer()
 	r.contextLength = m.MaxContextLength()
+	r.modelDigest = root.Manifest.Manifest.Config.Digest
 	return nil
 }
 
@@ -136,13 +138,13 @@ func loadTensorsFromManifest(root *model.Root) (map[string]*mlx.Array, error) {
 	return allTensors, nil
 }
 
-func (r *Runner) Run(host, port string, mux http.Handler) error {
-	g, ctx := errgroup.WithContext(context.Background())
+func (r *Runner) Run(ctx context.Context, host, port string, mux http.Handler) error {
+	g, gCtx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-gCtx.Done():
 				return nil
 			case request := <-r.Requests:
 				if err := request.Pipeline(request); err != nil {
@@ -165,9 +167,22 @@ func (r *Runner) Run(host, port string, mux http.Handler) error {
 		}
 	})
 
+	srv := &http.Server{
+		Addr:    net.JoinHostPort(host, port),
+		Handler: mux,
+	}
+
 	g.Go(func() error {
 		slog.Info("Starting HTTP server", "host", host, "port", port)
-		return http.ListenAndServe(net.JoinHostPort(host, port), mux)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		<-gCtx.Done()
+		return srv.Shutdown(context.Background())
 	})
 
 	return g.Wait()

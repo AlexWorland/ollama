@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/ollama/ollama/envconfig"
@@ -45,6 +47,9 @@ func Execute(args []string) error {
 	_ = flagSet.Bool("verbose", false, "Enable debug logging")
 	flagSet.Parse(args)
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
 	runner := Runner{
 		Requests: make(chan Request),
 	}
@@ -52,6 +57,9 @@ func Execute(args []string) error {
 	if err := runner.Load(modelName); err != nil {
 		return err
 	}
+
+	// Restore cached KV trie from a previous session.
+	runner.restoreCache()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +172,7 @@ func Execute(args []string) error {
 		mux.Handle(source, http.RedirectHandler(target, http.StatusPermanentRedirect))
 	}
 
-	return runner.Run("127.0.0.1", strconv.Itoa(port), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	runErr := runner.Run(ctx, "127.0.0.1", strconv.Itoa(port), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		recorder := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		t := time.Now()
@@ -182,6 +190,11 @@ func Execute(args []string) error {
 
 		slog.Log(r.Context(), level, "ServeHTTP", "method", r.Method, "path", r.URL.Path, "took", time.Since(t), "status", recorder.Status())
 	}))
+
+	// Save KV cache to disk on shutdown.
+	runner.saveCache()
+
+	return runErr
 }
 
 type statusRecorder struct {
@@ -201,5 +214,52 @@ func (w *statusRecorder) Status() string {
 func (w *statusRecorder) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+// restoreCache loads a previously saved KV cache trie from disk.
+func (r *Runner) restoreCache() {
+	if r.modelDigest == "" {
+		return
+	}
+
+	dir, err := kvCacheDir(r.modelDigest)
+	if err != nil {
+		slog.Warn("failed to resolve KV cache dir", "error", err)
+		return
+	}
+
+	// Initialize caches so we know the layer count for validation.
+	r.cache.ensureCaches(r.Model)
+
+	root, pagedOut, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
+	if err != nil {
+		slog.Warn("failed to load cached KV trie", "error", err)
+		return
+	}
+	if root == nil {
+		return
+	}
+
+	r.cache.root = root
+	r.cache.activePath = []*trieNode{root}
+	r.cache.pagedOutBytes = pagedOut
+	slog.Info("restored KV cache from disk", "paged_out", mlx.PrettyBytes(int(pagedOut)))
+}
+
+// saveCache writes the current KV cache trie to disk.
+func (r *Runner) saveCache() {
+	if r.cache.root == nil || r.modelDigest == "" {
+		return
+	}
+
+	dir, err := kvCacheDir(r.modelDigest)
+	if err != nil {
+		slog.Error("failed to resolve KV cache dir", "error", err)
+		return
+	}
+
+	if err := r.cache.saveTrie(dir, r.modelDigest); err != nil {
+		slog.Error("failed to save KV cache", "error", err)
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -1830,9 +1831,23 @@ func (s *llmServer) Close() error {
 
 	if s.cmd != nil {
 		slog.Debug("stopping llama server", "pid", s.Pid())
-		if err := s.cmd.Process.Kill(); err != nil {
-			return err
+
+		// Try graceful shutdown first (SIGTERM) so the runner can flush
+		// state (e.g. KV cache) before exiting. Fall back to SIGKILL
+		// after a timeout.
+		if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			// Signal failed (process may have already exited).
+			s.cmd.Process.Kill()
+		} else {
+			select {
+			case <-s.done:
+				// Exited gracefully.
+			case <-time.After(5 * time.Second):
+				slog.Debug("runner did not exit after SIGTERM, sending SIGKILL", "pid", s.Pid())
+				s.cmd.Process.Kill()
+			}
 		}
+
 		// if ProcessState is already populated, Wait already completed, no need to wait again
 		if s.cmd.ProcessState == nil {
 			slog.Debug("waiting for llama server to exit", "pid", s.Pid())
