@@ -36,6 +36,12 @@ type kvCache struct {
 	activePath    []*trieNode // current root→leaf path with live MLX arrays
 	caches        []cache.Cache
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
+
+	// Disk-backed eviction state.
+	cacheDir   string // directory for persisted/evicted safetensors files
+	modelID    string // for validation on reload
+	numLayers  int    // number of cache layers
+	nextDiskID int    // monotonic counter for unique eviction filenames
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.
@@ -192,8 +198,18 @@ func (c *kvCache) switchToPath(newPath []*trieNode, matched int) {
 	// Page in — walk the full new path, restoring from snapshots.
 	// Freed caches naturally pick up the first available snapshot.
 	// Caches already past a node skip it via offset check.
+	var pageInFromDisk int
 pageIn:
 	for _, node := range newPath {
+		// Load from disk if this node was evicted.
+		if !node.hasSnapshots() && node.diskFile != "" {
+			if err := c.loadNodeFromDisk(node); err != nil {
+				slog.Warn("failed to load node from disk", "error", err,
+					"path", node.diskFile)
+				break pageIn
+			}
+			pageInFromDisk++
+		}
 		if !node.hasSnapshots() {
 			continue
 		}
@@ -246,8 +262,8 @@ pageIn:
 		c.activePath[len(c.activePath)-1].lastUsed = time.Now()
 	}
 
-	if pageOutCount > 0 || pageInCount > 0 {
-		slog.Debug("switching cache path", "page_out", pageOutCount, "page_in", pageInCount)
+	if pageOutCount > 0 || pageInCount > 0 || pageInFromDisk > 0 {
+		slog.Info("switching cache path", "page_out", pageOutCount, "page_in", pageInCount, "page_in_disk", pageInFromDisk)
 	}
 }
 
@@ -476,6 +492,10 @@ func (c *kvCache) enforceEvictionPolicy() {
 			if n == c.root || activeSet[n] || len(n.children) > 1 {
 				return true
 			}
+			// Skip nodes already evicted to disk (no snapshots left to free).
+			if !n.hasSnapshots() {
+				return true
+			}
 			// Evict: oldest, then deepest, then largest.
 			if best == nil || cmp.Or(
 				n.lastUsed.Compare(best.lastUsed),
@@ -494,11 +514,16 @@ func (c *kvCache) enforceEvictionPolicy() {
 }
 
 // evictNode evicts a single node from the trie, freeing its snapshot memory.
+// Leaf nodes are saved to disk first so they can be reloaded later; if the
+// disk write fails, the node is removed entirely (destructive fallback).
 func (c *kvCache) evictNode(node *trieNode) {
 	if len(node.children) == 0 {
-		// Leaf: remove entirely.
-		slog.Debug("evicting leaf", "offset", node.startOffset(), "tokens", len(node.tokens), "freed", mlx.PrettyBytes(int(node.snapshotBytes())))
-		removeNode(node, &c.pagedOutBytes)
+		// Leaf: save to disk, keep node in trie.
+		if err := c.evictNodeToDisk(node); err != nil {
+			slog.Warn("failed to evict to disk, falling back to delete",
+				"error", err, "offset", node.startOffset())
+			removeNode(node, &c.pagedOutBytes)
+		}
 	} else if len(node.children) == 1 {
 		// Interior node with one child: merge with child.
 		before := c.pagedOutBytes
@@ -571,6 +596,9 @@ func (c *kvCache) dumpTree() {
 		}
 		if active[n] {
 			flags = append(flags, "active")
+		}
+		if n.diskFile != "" {
+			flags = append(flags, "disk")
 		}
 		if len(flags) > 0 {
 			label += " (" + flags[0]

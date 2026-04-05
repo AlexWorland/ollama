@@ -18,12 +18,22 @@ import (
 const trieFormatVersion = 1
 
 const (
-	nodeFilePrefix = "node_"
-	nodeFileSuffix = ".safetensors"
+	nodeFilePrefix    = "node_"
+	evictedFilePrefix = "evicted_"
+	nodeFileSuffix    = ".safetensors"
 )
 
 func nodeFileName(i int) string {
 	return fmt.Sprintf("%s%d%s", nodeFilePrefix, i, nodeFileSuffix)
+}
+
+// snapshotTypeStrings converts a slice of SnapshotType to strings for JSON serialization.
+func snapshotTypeStrings(types []cache.SnapshotType) []string {
+	out := make([]string, len(types))
+	for i, t := range types {
+		out[i] = string(t)
+	}
+	return out
 }
 
 // persistedNode is the JSON-serializable form of a trieNode.
@@ -148,6 +158,23 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 					return fmt.Errorf("save node %d: %w", i, err)
 				}
 			}
+		} else if node.diskFile != "" {
+			// Cold node: snapshot data lives on disk from a mid-session
+			// eviction. Rename the evicted file to the sequential name
+			// so loadTrie finds it on next startup.
+			destPath := filepath.Join(cacheDir, nodeFileName(i))
+			if err := os.Rename(node.diskFile, destPath); err != nil {
+				// Cross-device or other failure: try copy as fallback.
+				slog.Warn("rename failed, copying evicted file", "src", node.diskFile, "dest", destPath, "error", err)
+				data, readErr := os.ReadFile(node.diskFile)
+				if readErr != nil {
+					return fmt.Errorf("read evicted node %d: %w", i, readErr)
+				}
+				if writeErr := os.WriteFile(destPath, data, 0o600); writeErr != nil {
+					return fmt.Errorf("copy evicted node %d: %w", i, writeErr)
+				}
+			}
+			pn.SnapTypes = snapshotTypeStrings(node.snapTypes)
 		}
 
 		persisted.Nodes = append(persisted.Nodes, pn)
@@ -320,6 +347,182 @@ func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.Snapsho
 	}
 
 	return arrays, meta
+}
+
+// evictNodeToDisk serializes a node's snapshots to a safetensors file on disk,
+// then nils the in-memory snapshots. The node remains in the trie with diskFile
+// set so it can be reloaded on demand.
+func (c *kvCache) evictNodeToDisk(node *trieNode) error {
+	if c.cacheDir == "" {
+		return fmt.Errorf("cacheDir not set")
+	}
+	if err := os.MkdirAll(c.cacheDir, 0o700); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
+
+	arrays := make(map[string]*mlx.Array)
+	metadata := make(map[string]string)
+	snapTypes := make([]cache.SnapshotType, c.numLayers)
+
+	for li, snap := range node.snapshots {
+		exp := cache.ExportSnapshot(snap)
+		if exp == nil {
+			continue
+		}
+		snapTypes[li] = exp.Type
+
+		for name, arr := range exp.Arrays {
+			arrays[fmt.Sprintf("layer_%d_%s", li, name)] = arr
+		}
+		for key, val := range exp.Metadata {
+			metadata[fmt.Sprintf("layer_%d_%s", li, key)] = val
+		}
+	}
+
+	if len(arrays) == 0 {
+		return fmt.Errorf("no arrays to evict")
+	}
+
+	filename := fmt.Sprintf("%s%d%s", evictedFilePrefix, c.nextDiskID, nodeFileSuffix)
+	path := filepath.Join(c.cacheDir, filename)
+	if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
+		return fmt.Errorf("save evicted node: %w", err)
+	}
+
+	slog.Info("evicting node to disk", "offset", node.startOffset(),
+		"tokens", len(node.tokens), "bytes", node.snapshotBytes(), "path", filename)
+
+	node.snapTypes = snapTypes
+	node.diskFile = path
+	node.setSnapshots(nil, &c.pagedOutBytes)
+	c.nextDiskID++
+
+	c.enforceDiskEvictionPolicy()
+	return nil
+}
+
+// loadNodeFromDisk reloads a disk-evicted node's snapshots from its safetensors file.
+func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
+	sf, err := mlx.LoadSafetensorsNative(node.diskFile)
+	if err != nil {
+		return fmt.Errorf("load %s: %w", node.diskFile, err)
+	}
+	defer sf.Free()
+
+	snaps := make([]cache.Snapshot, c.numLayers)
+	for layer := 0; layer < c.numLayers; layer++ {
+		if layer >= len(node.snapTypes) || node.snapTypes[layer] == "" {
+			continue
+		}
+
+		snapType := node.snapTypes[layer]
+		arrays, meta := extractLayerData(sf, layer, snapType)
+		if len(arrays) == 0 {
+			// Close any partially loaded snapshots.
+			for _, s := range snaps {
+				if s != nil {
+					s.Close()
+				}
+			}
+			return fmt.Errorf("missing arrays for layer %d", layer)
+		}
+
+		snap, err := cache.ImportSnapshot(snapType, arrays, meta)
+		if err != nil {
+			for _, s := range snaps {
+				if s != nil {
+					s.Close()
+				}
+			}
+			return fmt.Errorf("import layer %d: %w", layer, err)
+		}
+		snaps[layer] = snap
+	}
+
+	slog.Info("loading node from disk", "offset", node.startOffset(),
+		"tokens", len(node.tokens), "path", filepath.Base(node.diskFile))
+
+	node.setSnapshots(snaps, &c.pagedOutBytes)
+	// Keep diskFile set — saveTrie will rename it. Clear snapTypes since
+	// they're now derivable from the live snapshots.
+	return nil
+}
+
+// enforceDiskEvictionPolicy deletes the oldest disk-backed nodes when total
+// disk usage exceeds OLLAMA_KV_CACHE_DISK_MAX. No-op when the cap is 0 (unlimited).
+func (c *kvCache) enforceDiskEvictionPolicy() {
+	cap := int64(envconfig.KvCacheDiskMax())
+	if cap <= 0 {
+		return
+	}
+
+	activeSet := make(map[*trieNode]bool, len(c.activePath))
+	for _, n := range c.activePath {
+		activeSet[n] = true
+	}
+
+	for {
+		// Sum disk usage from nodes that are on disk but not in memory.
+		var totalDiskBytes int64
+		walkNodes(c.root, func(n *trieNode) bool {
+			if n.diskFile != "" && !n.hasSnapshots() {
+				info, err := os.Stat(n.diskFile)
+				if err == nil {
+					totalDiskBytes += info.Size()
+				}
+			}
+			return true
+		})
+
+		if totalDiskBytes <= cap {
+			return
+		}
+
+		// Find the oldest disk-only node not on the active path.
+		var oldest *trieNode
+		walkNodes(c.root, func(n *trieNode) bool {
+			if n.diskFile == "" || n.hasSnapshots() || activeSet[n] {
+				return true
+			}
+			if oldest == nil || n.lastUsed.Before(oldest.lastUsed) {
+				oldest = n
+			}
+			return true
+		})
+
+		if oldest == nil {
+			return
+		}
+
+		slog.Info("disk eviction cap exceeded, deleting oldest",
+			"offset", oldest.startOffset(), "tokens", len(oldest.tokens),
+			"path", filepath.Base(oldest.diskFile))
+		os.Remove(oldest.diskFile)
+		oldest.diskFile = ""
+		oldest.snapTypes = nil
+
+		// Remove the node from the trie if it's a leaf with no data.
+		if len(oldest.children) == 0 {
+			removeNode(oldest, &c.pagedOutBytes)
+		}
+	}
+}
+
+// cleanStaleEvictedFiles removes orphaned evicted_*.safetensors files that
+// aren't referenced by any node in the trie. Called after loadTrie.
+func cleanStaleEvictedFiles(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, evictedFilePrefix) && strings.HasSuffix(name, nodeFileSuffix) {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+				slog.Warn("failed to remove stale evicted file", "file", name, "error", err)
+			}
+		}
+	}
 }
 
 // cleanStaleNodeFiles removes node_*.safetensors files with indices >= nodeCount.

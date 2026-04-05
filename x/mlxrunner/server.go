@@ -232,11 +232,23 @@ func (r *Runner) restoreCache() {
 	// Initialize caches so we know the layer count for validation.
 	r.cache.ensureCaches(r.Model)
 
+	// Always set disk-eviction fields so mid-session eviction works
+	// even when no prior cache is restored.
+	r.cache.cacheDir = dir
+	r.cache.modelID = r.modelDigest
+	r.cache.numLayers = len(r.cache.caches)
+
 	root, pagedOut, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
 	if err != nil {
 		slog.Warn("failed to load cached KV trie", "error", err)
 		return
 	}
+
+	// Remove orphaned evicted_*.safetensors left over from a crash
+	// during a previous session's mid-run eviction. These aren't
+	// referenced by trie.json (which uses node_* names at save time).
+	cleanStaleEvictedFiles(dir)
+
 	if root == nil {
 		return
 	}

@@ -19,6 +19,12 @@ type trieNode struct {
 	lastUsed  time.Time        // for LRU eviction
 	snapshots []cache.Snapshot // per-layer paged-out snapshot data (nil if not paged out)
 	user      bool             // true = explicit restore point (resist auto-merge)
+
+	// Disk-backed eviction: when a node is evicted to disk, snapshots are
+	// set to nil and diskFile points to the safetensors file on disk.
+	// snapTypes records the per-layer snapshot types for reimport.
+	diskFile  string               // path to evicted safetensors file ("" = not on disk)
+	snapTypes []cache.SnapshotType // preserved across eviction for disk reload
 }
 
 // startOffset returns the cumulative token offset at the start of this node's edge.

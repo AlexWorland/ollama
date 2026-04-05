@@ -296,6 +296,11 @@ func Uint64(key string, defaultValue uint64) func() uint64 {
 // Set aside VRAM per GPU
 var GpuOverhead = Uint64("OLLAMA_GPU_OVERHEAD", 0)
 
+// KvCacheDiskMax caps total disk usage for evicted KV cache nodes (bytes).
+// Default 0 means unlimited. When exceeded, the oldest disk-backed nodes
+// are deleted from disk and removed from the trie.
+var KvCacheDiskMax = Uint64("OLLAMA_KV_CACHE_DISK_MAX", 0)
+
 type EnvVar struct {
 	Name        string
 	Value       any
@@ -308,6 +313,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_DEBUG_LOG_REQUESTS": {"OLLAMA_DEBUG_LOG_REQUESTS", DebugLogRequests(), "Log inference request bodies and replay curl commands to a temp directory"},
 		"OLLAMA_FLASH_ATTENTION":    {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":      {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
+		"OLLAMA_KV_CACHE_DISK_MAX":  {"OLLAMA_KV_CACHE_DISK_MAX", KvCacheDiskMax(), "Maximum disk for evicted KV cache nodes in bytes (default: 0, unlimited)"},
 		"OLLAMA_GPU_OVERHEAD":       {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
 		"OLLAMA_HOST":               {"OLLAMA_HOST", Host(), "IP Address for the ollama server (default 127.0.0.1:11434)"},
 		"OLLAMA_KEEP_ALIVE":         {"OLLAMA_KEEP_ALIVE", KeepAlive(), "The duration that models stay loaded in memory (default \"5m\")"},
