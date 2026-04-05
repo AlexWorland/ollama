@@ -3,9 +3,11 @@ package mlxrunner
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -132,24 +134,8 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		}
 
 		if node.hasSnapshots() {
-			pn.SnapTypes = make([]string, len(c.caches))
-			arrays := make(map[string]*mlx.Array)
-			metadata := make(map[string]string)
-
-			for li, snap := range node.snapshots {
-				exp := cache.ExportSnapshot(snap)
-				if exp == nil {
-					continue
-				}
-				pn.SnapTypes[li] = string(exp.Type)
-
-				for name, arr := range exp.Arrays {
-					arrays[fmt.Sprintf("layer_%d_%s", li, name)] = arr
-				}
-				for key, val := range exp.Metadata {
-					metadata[fmt.Sprintf("layer_%d_%s", li, key)] = val
-				}
-			}
+			arrays, metadata, types := exportNodeSnapshots(node.snapshots)
+			pn.SnapTypes = snapshotTypeStrings(types)
 
 			if len(arrays) > 0 {
 				path := filepath.Join(cacheDir, nodeFileName(i))
@@ -165,14 +151,10 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 			slog.Debug("saveTrie: renaming cold node", "node", i, "src", filepath.Base(node.diskFile), "dest", nodeFileName(i))
 			destPath := filepath.Join(cacheDir, nodeFileName(i))
 			if err := os.Rename(node.diskFile, destPath); err != nil {
-				// Cross-device or other failure: try copy as fallback.
+				// Cross-device or other failure: stream-copy as fallback.
 				slog.Warn("rename failed, copying evicted file", "src", node.diskFile, "dest", destPath, "error", err)
-				data, readErr := os.ReadFile(node.diskFile)
-				if readErr != nil {
-					return fmt.Errorf("read evicted node %d: %w", i, readErr)
-				}
-				if writeErr := os.WriteFile(destPath, data, 0o600); writeErr != nil {
-					return fmt.Errorf("copy evicted node %d: %w", i, writeErr)
+				if copyErr := streamCopyFile(node.diskFile, destPath); copyErr != nil {
+					return fmt.Errorf("copy evicted node %d: %w", i, copyErr)
 				}
 			}
 			pn.SnapTypes = snapshotTypeStrings(node.snapTypes)
@@ -350,6 +332,31 @@ func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.Snapsho
 	return arrays, meta
 }
 
+// exportNodeSnapshots builds layer-prefixed arrays and metadata maps from a
+// node's in-memory snapshots, ready for SaveSafetensorsWithMetadata.
+func exportNodeSnapshots(snapshots []cache.Snapshot) (map[string]*mlx.Array, map[string]string, []cache.SnapshotType) {
+	arrays := make(map[string]*mlx.Array)
+	metadata := make(map[string]string)
+	snapTypes := make([]cache.SnapshotType, len(snapshots))
+
+	for li, snap := range snapshots {
+		exp := cache.ExportSnapshot(snap)
+		if exp == nil {
+			continue
+		}
+		snapTypes[li] = exp.Type
+
+		for name, arr := range exp.Arrays {
+			arrays[fmt.Sprintf("layer_%d_%s", li, name)] = arr
+		}
+		for key, val := range exp.Metadata {
+			metadata[fmt.Sprintf("layer_%d_%s", li, key)] = val
+		}
+	}
+
+	return arrays, metadata, snapTypes
+}
+
 // evictNodeToDisk serializes a node's snapshots to a safetensors file on disk,
 // then nils the in-memory snapshots. The node remains in the trie with diskFile
 // set so it can be reloaded on demand.
@@ -364,24 +371,7 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 		return fmt.Errorf("create cache dir: %w", err)
 	}
 
-	arrays := make(map[string]*mlx.Array)
-	metadata := make(map[string]string)
-	snapTypes := make([]cache.SnapshotType, c.numLayers)
-
-	for li, snap := range node.snapshots {
-		exp := cache.ExportSnapshot(snap)
-		if exp == nil {
-			continue
-		}
-		snapTypes[li] = exp.Type
-
-		for name, arr := range exp.Arrays {
-			arrays[fmt.Sprintf("layer_%d_%s", li, name)] = arr
-		}
-		for key, val := range exp.Metadata {
-			metadata[fmt.Sprintf("layer_%d_%s", li, key)] = val
-		}
-	}
+	arrays, metadata, snapTypes := exportNodeSnapshots(node.snapshots)
 
 	slog.Debug("evictNodeToDisk: exported snapshots", "arrays", len(arrays), "metadata", len(metadata))
 
@@ -463,68 +453,63 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 // enforceDiskEvictionPolicy deletes the oldest disk-backed nodes when total
 // disk usage exceeds OLLAMA_KV_CACHE_DISK_MAX. No-op when the cap is 0 (unlimited).
 func (c *kvCache) enforceDiskEvictionPolicy() {
-	cap := int64(envconfig.KvCacheDiskMax())
-	if cap <= 0 {
+	diskCap := int64(envconfig.KvCacheDiskMax())
+	if diskCap <= 0 {
 		slog.Debug("enforceDiskEvictionPolicy: no disk cap set, skipping")
 		return
 	}
-	slog.Debug("enforceDiskEvictionPolicy: checking disk usage", "cap", cap)
+	slog.Debug("enforceDiskEvictionPolicy: checking disk usage", "cap", diskCap)
 
 	activeSet := make(map[*trieNode]bool, len(c.activePath))
 	for _, n := range c.activePath {
 		activeSet[n] = true
 	}
 
-	for {
-		// Sum disk usage from nodes that are on disk but not in memory.
-		var totalDiskBytes int64
-		var diskNodeCount int
-		walkNodes(c.root, func(n *trieNode) bool {
-			if n.diskFile != "" && !n.hasSnapshots() {
-				info, err := os.Stat(n.diskFile)
-				if err == nil {
-					totalDiskBytes += info.Size()
-					diskNodeCount++
-				}
+	// Single walk: collect all eligible disk-backed nodes with file sizes.
+	type diskEntry struct {
+		node *trieNode
+		size int64
+	}
+	var entries []diskEntry
+	var totalDiskBytes int64
+	walkNodes(c.root, func(n *trieNode) bool {
+		if n.diskFile != "" && !n.hasSnapshots() && !activeSet[n] {
+			info, err := os.Stat(n.diskFile)
+			if err == nil {
+				entries = append(entries, diskEntry{n, info.Size()})
+				totalDiskBytes += info.Size()
 			}
-			return true
-		})
-
-		slog.Debug("enforceDiskEvictionPolicy: disk usage", "totalDiskBytes", totalDiskBytes,
-			"diskNodes", diskNodeCount, "cap", cap)
-
-		if totalDiskBytes <= cap {
-			return
 		}
+		return true
+	})
 
-		// Find the oldest disk-only node not on the active path.
-		var oldest *trieNode
-		walkNodes(c.root, func(n *trieNode) bool {
-			if n.diskFile == "" || n.hasSnapshots() || activeSet[n] {
-				return true
-			}
-			if oldest == nil || n.lastUsed.Before(oldest.lastUsed) {
-				oldest = n
-			}
-			return true
-		})
+	slog.Debug("enforceDiskEvictionPolicy: disk usage", "totalDiskBytes", totalDiskBytes,
+		"diskNodes", len(entries), "cap", diskCap)
 
-		if oldest == nil {
-			slog.Debug("enforceDiskEvictionPolicy: no eligible node to delete")
-			return
+	if totalDiskBytes <= diskCap {
+		return
+	}
+
+	// Sort oldest-first and delete until under cap.
+	slices.SortFunc(entries, func(a, b diskEntry) int {
+		return a.node.lastUsed.Compare(b.node.lastUsed)
+	})
+
+	for _, e := range entries {
+		if totalDiskBytes <= diskCap {
+			break
 		}
-
 		slog.Info("disk eviction cap exceeded, deleting oldest",
-			"offset", oldest.startOffset(), "tokens", len(oldest.tokens),
-			"path", filepath.Base(oldest.diskFile))
-		os.Remove(oldest.diskFile)
-		oldest.diskFile = ""
-		oldest.snapTypes = nil
+			"offset", e.node.startOffset(), "tokens", len(e.node.tokens),
+			"path", filepath.Base(e.node.diskFile))
+		os.Remove(e.node.diskFile)
+		e.node.diskFile = ""
+		e.node.snapTypes = nil
+		totalDiskBytes -= e.size
 
-		// Remove the node from the trie if it's a leaf with no data.
-		if len(oldest.children) == 0 {
-			slog.Debug("enforceDiskEvictionPolicy: removing empty leaf from trie", "offset", oldest.startOffset())
-			removeNode(oldest, &c.pagedOutBytes)
+		if len(e.node.children) == 0 {
+			slog.Debug("enforceDiskEvictionPolicy: removing empty leaf from trie", "offset", e.node.startOffset())
+			removeNode(e.node, &c.pagedOutBytes)
 		}
 	}
 }
@@ -570,6 +555,33 @@ func cleanStaleNodeFiles(dir string, nodeCount int) {
 			}
 		}
 	}
+}
+
+// streamCopyFile copies src to dst using streaming I/O to avoid loading the
+// entire file into memory (important for large safetensors files).
+func streamCopyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return fmt.Errorf("copy to %s: %w", dst, err)
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return fmt.Errorf("fsync %s: %w", dst, err)
+	}
+	return out.Close()
 }
 
 // atomicWriteFile writes data to tmpPath, fsyncs it, then renames to finalPath.
