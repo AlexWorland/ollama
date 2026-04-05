@@ -29,23 +29,14 @@ func nodeFileName(i int) string {
 	return fmt.Sprintf("%s%d%s", nodeFilePrefix, i, nodeFileSuffix)
 }
 
-// snapshotTypeStrings converts a slice of SnapshotType to strings for JSON serialization.
-func snapshotTypeStrings(types []cache.SnapshotType) []string {
-	out := make([]string, len(types))
-	for i, t := range types {
-		out[i] = string(t)
-	}
-	return out
-}
-
 // persistedNode is the JSON-serializable form of a trieNode.
 // The node's ID is its index in the persistedTrie.Nodes slice.
 type persistedNode struct {
-	Tokens    []int32  `json:"tokens"`
-	EndOffset int      `json:"end_offset"`
-	User      bool     `json:"user,omitempty"`
-	Children  []int    `json:"children,omitempty"`
-	SnapTypes []string `json:"snap_types,omitempty"` // per-layer: "kv","rotating","recurrent",""
+	Tokens    []int32              `json:"tokens"`
+	EndOffset int                  `json:"end_offset"`
+	User      bool                 `json:"user,omitempty"`
+	Children  []int                `json:"children,omitempty"`
+	SnapTypes []cache.SnapshotType `json:"snap_types,omitempty"` // per-layer: "kv","rotating","recurrent",""
 }
 
 // persistedTrie is the JSON-serializable form of the full trie.
@@ -78,7 +69,6 @@ func (c *kvCache) captureActiveFrontier() {
 		return
 	}
 	fromOffset := frontier.startOffset()
-	slog.Debug("capturing active frontier snapshot", "offset", fromOffset, "tokens", len(frontier.tokens))
 	snaps := make([]cache.Snapshot, len(c.caches))
 	for j, kv := range c.caches {
 		if kv == nil {
@@ -107,10 +97,8 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 	})
 
 	if len(nodes) <= 1 {
-		slog.Debug("skipping trie save, only root node")
 		return nil
 	}
-	slog.Debug("saving trie", "nodes", len(nodes), "layers", len(c.caches))
 
 	persisted := persistedTrie{
 		Version:   trieFormatVersion,
@@ -135,11 +123,10 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 
 		if node.hasSnapshots() {
 			arrays, metadata, types := exportNodeSnapshots(node.snapshots)
-			pn.SnapTypes = snapshotTypeStrings(types)
+			pn.SnapTypes = types
 
 			if len(arrays) > 0 {
 				path := filepath.Join(cacheDir, nodeFileName(i))
-				slog.Debug("saving node snapshot", "node", i, "arrays", len(arrays))
 				if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
 					return fmt.Errorf("save node %d: %w", i, err)
 				}
@@ -148,7 +135,6 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 			// Cold node: snapshot data lives on disk from a mid-session
 			// eviction. Rename the evicted file to the sequential name
 			// so loadTrie finds it on next startup.
-			slog.Debug("saveTrie: renaming cold node", "node", i, "src", filepath.Base(node.diskFile), "dest", nodeFileName(i))
 			destPath := filepath.Join(cacheDir, nodeFileName(i))
 			if err := os.Rename(node.diskFile, destPath); err != nil {
 				// Cross-device or other failure: stream-copy as fallback.
@@ -157,7 +143,7 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 					return fmt.Errorf("copy evicted node %d: %w", i, copyErr)
 				}
 			}
-			pn.SnapTypes = snapshotTypeStrings(node.snapTypes)
+			pn.SnapTypes = node.snapTypes
 		}
 
 		persisted.Nodes = append(persisted.Nodes, pn)
@@ -186,10 +172,8 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 // no cache exists or the version/model doesn't match.
 func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error) {
 	triePath := filepath.Join(cacheDir, "trie.json")
-	slog.Debug("loading trie", "path", triePath)
 	data, err := os.ReadFile(triePath)
 	if os.IsNotExist(err) {
-		slog.Debug("no cached trie found")
 		return nil, 0, nil
 	}
 	if err != nil {
@@ -264,7 +248,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 				continue
 			}
 
-			snapType := cache.SnapshotType(pn.SnapTypes[layer])
+			snapType := pn.SnapTypes[layer]
 			arrays, meta := extractLayerData(sf, layer, snapType)
 			if len(arrays) == 0 {
 				slog.Warn("missing arrays for layer", "node", i, "layer", layer)
@@ -297,10 +281,8 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 
 		trieNodes[i].snapshots = snaps
 		pagedOutBytes += nodeBytes
-		slog.Debug("loaded node snapshot", "node", i, "bytes", nodeBytes)
 	}
 
-	slog.Debug("trie loaded", "nodes", len(trieNodes), "paged_out_bytes", pagedOutBytes)
 	root := trieNodes[0]
 	return root, pagedOutBytes, nil
 }
@@ -364,16 +346,7 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	if c.cacheDir == "" {
 		return fmt.Errorf("cacheDir not set")
 	}
-	slog.Debug("evictNodeToDisk: starting", "offset", node.startOffset(),
-		"tokens", len(node.tokens), "bytes", node.snapshotBytes(), "cacheDir", c.cacheDir)
-
-	if err := os.MkdirAll(c.cacheDir, 0o700); err != nil {
-		return fmt.Errorf("create cache dir: %w", err)
-	}
-
 	arrays, metadata, snapTypes := exportNodeSnapshots(node.snapshots)
-
-	slog.Debug("evictNodeToDisk: exported snapshots", "arrays", len(arrays), "metadata", len(metadata))
 
 	if len(arrays) == 0 {
 		return fmt.Errorf("no arrays to evict")
@@ -381,9 +354,14 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 
 	filename := fmt.Sprintf("%s%d%s", evictedFilePrefix, c.nextDiskID, nodeFileSuffix)
 	path := filepath.Join(c.cacheDir, filename)
-	slog.Debug("evictNodeToDisk: writing safetensors", "path", filename, "diskID", c.nextDiskID)
 	if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
 		return fmt.Errorf("save evicted node: %w", err)
+	}
+
+	info, statErr := os.Stat(path)
+	var fileSize int64
+	if statErr == nil {
+		fileSize = info.Size()
 	}
 
 	slog.Info("evicting node to disk", "offset", node.startOffset(),
@@ -391,9 +369,9 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 
 	node.snapTypes = snapTypes
 	node.diskFile = path
+	node.diskFileSize = fileSize
 	node.setSnapshots(nil, &c.pagedOutBytes)
 	c.nextDiskID++
-	slog.Debug("evictNodeToDisk: complete", "pagedOutBytes", c.pagedOutBytes, "nextDiskID", c.nextDiskID)
 
 	c.enforceDiskEvictionPolicy()
 	return nil
@@ -401,9 +379,6 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 
 // loadNodeFromDisk reloads a disk-evicted node's snapshots from its safetensors file.
 func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
-	slog.Debug("loadNodeFromDisk: starting", "offset", node.startOffset(),
-		"tokens", len(node.tokens), "diskFile", filepath.Base(node.diskFile))
-
 	sf, err := mlx.LoadSafetensorsNative(node.diskFile)
 	if err != nil {
 		return fmt.Errorf("load %s: %w", node.diskFile, err)
@@ -411,7 +386,14 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	defer sf.Free()
 
 	snaps := make([]cache.Snapshot, c.numLayers)
-	var loadedLayers int
+	closeSnaps := func() {
+		for _, s := range snaps {
+			if s != nil {
+				s.Close()
+			}
+		}
+	}
+
 	for layer := 0; layer < c.numLayers; layer++ {
 		if layer >= len(node.snapTypes) || node.snapTypes[layer] == "" {
 			continue
@@ -420,33 +402,22 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 		snapType := node.snapTypes[layer]
 		arrays, meta := extractLayerData(sf, layer, snapType)
 		if len(arrays) == 0 {
-			for _, s := range snaps {
-				if s != nil {
-					s.Close()
-				}
-			}
+			closeSnaps()
 			return fmt.Errorf("missing arrays for layer %d", layer)
 		}
 
 		snap, err := cache.ImportSnapshot(snapType, arrays, meta)
 		if err != nil {
-			for _, s := range snaps {
-				if s != nil {
-					s.Close()
-				}
-			}
+			closeSnaps()
 			return fmt.Errorf("import layer %d: %w", layer, err)
 		}
 		snaps[layer] = snap
-		loadedLayers++
 	}
 
-	slog.Info("loading node from disk", "offset", node.startOffset(),
+	slog.Info("loaded node from disk", "offset", node.startOffset(),
 		"tokens", len(node.tokens), "path", filepath.Base(node.diskFile))
-	slog.Debug("loadNodeFromDisk: imported layers", "loaded", loadedLayers, "total", c.numLayers)
 
 	node.setSnapshots(snaps, &c.pagedOutBytes)
-	slog.Debug("loadNodeFromDisk: complete", "pagedOutBytes", c.pagedOutBytes)
 	return nil
 }
 
@@ -455,17 +426,15 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 func (c *kvCache) enforceDiskEvictionPolicy() {
 	diskCap := int64(envconfig.KvCacheDiskMax())
 	if diskCap <= 0 {
-		slog.Debug("enforceDiskEvictionPolicy: no disk cap set, skipping")
 		return
 	}
-	slog.Debug("enforceDiskEvictionPolicy: checking disk usage", "cap", diskCap)
 
 	activeSet := make(map[*trieNode]bool, len(c.activePath))
 	for _, n := range c.activePath {
 		activeSet[n] = true
 	}
 
-	// Single walk: collect all eligible disk-backed nodes with file sizes.
+	// Single walk: collect all eligible disk-backed nodes using cached sizes.
 	type diskEntry struct {
 		node *trieNode
 		size int64
@@ -474,17 +443,11 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 	var totalDiskBytes int64
 	walkNodes(c.root, func(n *trieNode) bool {
 		if n.diskFile != "" && !n.hasSnapshots() && !activeSet[n] {
-			info, err := os.Stat(n.diskFile)
-			if err == nil {
-				entries = append(entries, diskEntry{n, info.Size()})
-				totalDiskBytes += info.Size()
-			}
+			entries = append(entries, diskEntry{n, n.diskFileSize})
+			totalDiskBytes += n.diskFileSize
 		}
 		return true
 	})
-
-	slog.Debug("enforceDiskEvictionPolicy: disk usage", "totalDiskBytes", totalDiskBytes,
-		"diskNodes", len(entries), "cap", diskCap)
 
 	if totalDiskBytes <= diskCap {
 		return
@@ -504,11 +467,11 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 			"path", filepath.Base(e.node.diskFile))
 		os.Remove(e.node.diskFile)
 		e.node.diskFile = ""
+		e.node.diskFileSize = 0
 		e.node.snapTypes = nil
 		totalDiskBytes -= e.size
 
 		if len(e.node.children) == 0 {
-			slog.Debug("enforceDiskEvictionPolicy: removing empty leaf from trie", "offset", e.node.startOffset())
 			removeNode(e.node, &c.pagedOutBytes)
 		}
 	}
