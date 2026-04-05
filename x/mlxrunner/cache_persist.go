@@ -270,12 +270,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 		sf.Free()
 
 		if !allLoaded {
-			// Close any successfully loaded snapshots for this node.
-			for _, s := range snaps {
-				if s != nil {
-					s.Close()
-				}
-			}
+			closeSnapshots(snaps)
 			continue
 		}
 
@@ -287,9 +282,17 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 	return root, pagedOutBytes, nil
 }
 
+// closeSnapshots closes all non-nil snapshots in the slice.
+func closeSnapshots(snaps []cache.Snapshot) {
+	for _, s := range snaps {
+		if s != nil {
+			s.Close()
+		}
+	}
+}
+
 // extractLayerData pulls arrays and metadata for a specific layer from a
-// loaded safetensors file. Array names are expected to have the format
-// "layer_{i}_{name}".
+// loaded safetensors file.
 func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.SnapshotType) (map[string]*mlx.Array, map[string]string) {
 	prefix := fmt.Sprintf("layer_%d_", layer)
 	arrays := make(map[string]*mlx.Array)
@@ -386,14 +389,6 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	defer sf.Free()
 
 	snaps := make([]cache.Snapshot, c.numLayers)
-	closeSnaps := func() {
-		for _, s := range snaps {
-			if s != nil {
-				s.Close()
-			}
-		}
-	}
-
 	for layer := 0; layer < c.numLayers; layer++ {
 		if layer >= len(node.snapTypes) || node.snapTypes[layer] == "" {
 			continue
@@ -402,13 +397,13 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 		snapType := node.snapTypes[layer]
 		arrays, meta := extractLayerData(sf, layer, snapType)
 		if len(arrays) == 0 {
-			closeSnaps()
+			closeSnapshots(snaps)
 			return fmt.Errorf("missing arrays for layer %d", layer)
 		}
 
 		snap, err := cache.ImportSnapshot(snapType, arrays, meta)
 		if err != nil {
-			closeSnaps()
+			closeSnapshots(snaps)
 			return fmt.Errorf("import layer %d: %w", layer, err)
 		}
 		snaps[layer] = snap
