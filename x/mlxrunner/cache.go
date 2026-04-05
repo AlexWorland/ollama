@@ -20,6 +20,7 @@ import (
 	"cmp"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"time"
 
@@ -203,6 +204,9 @@ pageIn:
 	for _, node := range newPath {
 		// Load from disk if this node was evicted.
 		if !node.hasSnapshots() && node.diskFile != "" {
+			slog.Debug("switchToPath: loading evicted node from disk",
+				"offset", node.startOffset(), "tokens", len(node.tokens),
+				"diskFile", filepath.Base(node.diskFile))
 			if err := c.loadNodeFromDisk(node); err != nil {
 				slog.Warn("failed to load node from disk", "error", err,
 					"path", node.diskFile)
@@ -519,6 +523,8 @@ func (c *kvCache) enforceEvictionPolicy() {
 func (c *kvCache) evictNode(node *trieNode) {
 	if len(node.children) == 0 {
 		// Leaf: save to disk, keep node in trie.
+		slog.Debug("evictNode: attempting disk eviction for leaf", "offset", node.startOffset(),
+			"tokens", len(node.tokens), "bytes", node.snapshotBytes())
 		if err := c.evictNodeToDisk(node); err != nil {
 			slog.Warn("failed to evict to disk, falling back to delete",
 				"error", err, "offset", node.startOffset())
