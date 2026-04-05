@@ -202,7 +202,6 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 		return nil, 0, nil
 	}
 
-	// First pass: create all trieNode objects.
 	trieNodes := make([]*trieNode, len(persisted.Nodes))
 	for i, pn := range persisted.Nodes {
 		trieNodes[i] = &trieNode{
@@ -213,7 +212,6 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 		}
 	}
 
-	// Second pass: wire parent/child pointers.
 	for i, pn := range persisted.Nodes {
 		for _, childID := range pn.Children {
 			if childID < 0 || childID >= len(trieNodes) {
@@ -225,7 +223,6 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 		}
 	}
 
-	// Third pass: load snapshots.
 	var pagedOutBytes int64
 	for i, pn := range persisted.Nodes {
 		if len(pn.SnapTypes) == 0 {
@@ -388,8 +385,8 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	}
 	defer sf.Free()
 
-	snaps := make([]cache.Snapshot, c.numLayers)
-	for layer := 0; layer < c.numLayers; layer++ {
+	snaps := make([]cache.Snapshot, len(c.caches))
+	for layer := 0; layer < len(c.caches); layer++ {
 		if layer >= len(node.snapTypes) || node.snapTypes[layer] == "" {
 			continue
 		}

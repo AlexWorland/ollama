@@ -236,7 +236,6 @@ func (r *Runner) restoreCache() {
 	// even when no prior cache is restored.
 	r.cache.cacheDir = dir
 	r.cache.modelID = r.modelDigest
-	r.cache.numLayers = len(r.cache.caches)
 
 	root, pagedOut, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
 	if err != nil {
@@ -261,17 +260,11 @@ func (r *Runner) restoreCache() {
 
 // saveCache writes the current KV cache trie to disk.
 func (r *Runner) saveCache() {
-	if r.cache.root == nil || r.modelDigest == "" {
+	if r.cache.root == nil || r.cache.cacheDir == "" {
 		return
 	}
 
-	dir, err := kvCacheDir(r.modelDigest)
-	if err != nil {
-		slog.Error("failed to resolve KV cache dir", "error", err)
-		return
-	}
-
-	if err := r.cache.saveTrie(dir, r.modelDigest); err != nil {
+	if err := r.cache.saveTrie(r.cache.cacheDir, r.cache.modelID); err != nil {
 		slog.Error("failed to save KV cache", "error", err)
 	}
 }

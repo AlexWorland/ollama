@@ -41,7 +41,6 @@ type kvCache struct {
 	// Disk-backed eviction state.
 	cacheDir   string // directory for persisted/evicted safetensors files
 	modelID    string // for validation on reload
-	numLayers  int    // number of cache layers
 	nextDiskID int    // monotonic counter for unique eviction filenames
 }
 
@@ -490,30 +489,38 @@ func (c *kvCache) enforceEvictionPolicy() {
 		activeSet[n] = true
 	}
 
-	for c.pagedOutBytes > maxPagedOutBytes {
-		var best *trieNode
-		walkNodes(c.root, func(n *trieNode) bool {
-			if n == c.root || activeSet[n] || len(n.children) > 1 {
-				return true
-			}
-			// Skip nodes already evicted to disk (no snapshots left to free).
-			if !n.hasSnapshots() {
-				return true
-			}
-			// Evict: oldest, then deepest, then largest.
-			if best == nil || cmp.Or(
-				n.lastUsed.Compare(best.lastUsed),
-				cmp.Compare(best.endOffset, n.endOffset),
-				cmp.Compare(best.snapshotBytes(), n.snapshotBytes()),
-			) < 0 {
-				best = n
-			}
+	// Collect all candidates in one walk and sort once (oldest, deepest,
+	// largest) instead of re-walking per eviction.
+	var candidates []*trieNode
+	walkNodes(c.root, func(n *trieNode) bool {
+		if n == c.root || activeSet[n] || len(n.children) > 1 {
 			return true
-		})
-		if best == nil {
+		}
+		if !n.hasSnapshots() {
+			return true
+		}
+		candidates = append(candidates, n)
+		return true
+	})
+
+	slices.SortFunc(candidates, func(a, b *trieNode) int {
+		return cmp.Or(
+			a.lastUsed.Compare(b.lastUsed),
+			cmp.Compare(b.endOffset, a.endOffset),
+			cmp.Compare(b.snapshotBytes(), a.snapshotBytes()),
+		)
+	})
+
+	for _, node := range candidates {
+		if c.pagedOutBytes <= maxPagedOutBytes {
 			break
 		}
-		c.evictNode(best)
+		// Re-validate: evictNode may have structurally changed the trie
+		// (mergeWithChild can alter child counts of surrounding nodes).
+		if node.parent == nil || activeSet[node] || !node.hasSnapshots() || len(node.children) > 1 {
+			continue
+		}
+		c.evictNode(node)
 	}
 }
 
