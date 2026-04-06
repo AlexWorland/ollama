@@ -40,6 +40,15 @@ func makeTestKVCache(t *testing.T, numLayers int) *kvCache {
 	return c
 }
 
+// takeSnapshots captures per-layer snapshots at fromOffset and attaches them to node.
+func takeSnapshots(c *kvCache, node *trieNode, fromOffset int) {
+	snaps := make([]cache.Snapshot, len(c.caches))
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(fromOffset)
+	}
+	node.setSnapshots(snaps, &c.pagedOutBytes)
+}
+
 // feedTokens simulates the cache receiving tokens by calling Update on each
 // layer with zero arrays of the right shape.
 func feedTokens(c *kvCache, count int) {
@@ -65,21 +74,13 @@ func TestSaveLoadTrieRoundTrip(t *testing.T) {
 	// Feed 3 tokens and create a snapshot at the root's child.
 	feedTokens(c, 3)
 	child := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	child.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, child, 0)
 	c.activePath = append(c.activePath, child)
 
 	// Feed 2 more tokens and create a grandchild.
 	feedTokens(c, 2)
 	grandchild := child.appendTokens(c.root, []int32{4, 5}, 5)
-	snaps2 := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps2[j] = kv.Snapshot(3)
-	}
-	grandchild.setSnapshots(snaps2, &c.pagedOutBytes)
+	takeSnapshots(c, grandchild, 3)
 	c.activePath = append(c.activePath, grandchild)
 
 	if c.pagedOutBytes == 0 {
@@ -187,11 +188,7 @@ func TestLoadTrieModelMismatch(t *testing.T) {
 	c := makeTestKVCache(t, numLayers)
 	feedTokens(c, 2)
 	child := c.root.appendTokens(c.root, []int32{1, 2}, 2)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	child.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, child, 0)
 
 	if err := saveTrieTo(c, dir, "sha256:model_a"); err != nil {
 		t.Fatal(err)
@@ -217,11 +214,7 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 	c := makeTestKVCache(t, numLayers)
 	feedTokens(c, 2)
 	child := c.root.appendTokens(c.root, []int32{1, 2}, 2)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	child.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, child, 0)
 
 	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal(err)
@@ -324,19 +317,11 @@ func TestSaveLoadBranchingTrie(t *testing.T) {
 
 	feedTokens(c, 2)
 	branchA := shared.appendTokens(c.root, []int32{4, 5}, 5)
-	branchASnaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		branchASnaps[j] = kv.Snapshot(3)
-	}
-	branchA.setSnapshots(branchASnaps, &c.pagedOutBytes)
+	takeSnapshots(c, branchA, 3)
 
 	feedTokens(c, 2)
 	branchB := shared.appendTokens(c.root, []int32{6, 7}, 5)
-	branchBSnaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		branchBSnaps[j] = kv.Snapshot(3)
-	}
-	branchB.setSnapshots(branchBSnaps, &c.pagedOutBytes)
+	takeSnapshots(c, branchB, 3)
 
 	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal(err)
@@ -381,11 +366,7 @@ func TestEvictAndReloadNodeRoundTrip(t *testing.T) {
 	// Build root -> [1,2,3] leaf with snapshots.
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 
 	if c.pagedOutBytes == 0 {
 		t.Fatal("expected non-zero pagedOutBytes after snapshot")
@@ -465,11 +446,7 @@ func TestEvictNodeDiskFailureFallsBackToDelete(t *testing.T) {
 
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 	c.activePath = []*trieNode{c.root}
 
 	beforeBytes := c.pagedOutBytes
@@ -500,27 +477,15 @@ func TestEnforceDiskEvictionPolicyDeletesOldest(t *testing.T) {
 	// Create 3 leaf nodes with disk-backed files.
 	feedTokens(c, 2)
 	leafA := c.root.appendTokens(c.root, []int32{1, 2}, 2)
-	snapsA := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snapsA[j] = kv.Snapshot(0)
-	}
-	leafA.setSnapshots(snapsA, &c.pagedOutBytes)
+	takeSnapshots(c, leafA, 0)
 
 	feedTokens(c, 2)
 	leafB := c.root.appendTokens(c.root, []int32{3, 4}, 2)
-	snapsB := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snapsB[j] = kv.Snapshot(0)
-	}
-	leafB.setSnapshots(snapsB, &c.pagedOutBytes)
+	takeSnapshots(c, leafB, 0)
 
 	feedTokens(c, 2)
 	leafC := c.root.appendTokens(c.root, []int32{5, 6}, 2)
-	snapsC := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snapsC[j] = kv.Snapshot(0)
-	}
-	leafC.setSnapshots(snapsC, &c.pagedOutBytes)
+	takeSnapshots(c, leafC, 0)
 
 	// Evict all three to disk with staggered timestamps.
 	c.activePath = []*trieNode{c.root} // none active
@@ -572,11 +537,7 @@ func TestSaveTrieWithColdNodes(t *testing.T) {
 	// Build root -> [1,2,3] with snapshots, then evict to disk.
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 	c.activePath = []*trieNode{c.root}
 
 	if err := c.evictNodeToDisk(leaf); err != nil {
@@ -720,11 +681,7 @@ func TestNodeFileHashStableAfterSplit(t *testing.T) {
 	// Build root -> [1,2,3,4] with snapshots.
 	feedTokens(c, 4)
 	child := c.root.appendTokens(c.root, []int32{1, 2, 3, 4}, 4)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	child.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, child, 0)
 
 	// Hash of the full [1,2,3,4] node before split.
 	hashBefore := nodeFileHash(child)
@@ -755,11 +712,7 @@ func TestIncrementalSaveSkipsColdNodes(t *testing.T) {
 	// Build root -> [1,2,3] with snapshots, evict to disk.
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 	c.activePath = []*trieNode{c.root}
 
 	if err := c.evictNodeToDisk(leaf); err != nil {
@@ -799,11 +752,7 @@ func TestCrashSafetyPartialSave(t *testing.T) {
 	c := makeTestKVCache(t, numLayers)
 	feedTokens(c, 3)
 	child := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	child.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, child, 0)
 	c.activePath = []*trieNode{c.root, child}
 
 	if err := saveTrieTo(c, dir, modelID); err != nil {
@@ -855,11 +804,7 @@ func TestProcessDiskCompletionsOnFailure(t *testing.T) {
 
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 	c.activePath = []*trieNode{c.root}
 
 	// Simulate a failed async write by injecting a failed result.
@@ -870,9 +815,8 @@ func TestProcessDiskCompletionsOnFailure(t *testing.T) {
 	c.totalDiskBytes = 1000
 
 	c.diskWriter.results <- diskWriteResult{
-		node:     leaf,
-		fileSize: 1000,
-		err:      fmt.Errorf("simulated write failure"),
+		node: leaf,
+		err:  fmt.Errorf("simulated write failure"),
 	}
 
 	c.processDiskCompletions()
@@ -899,11 +843,7 @@ func TestAsyncEvictNodeToDisk(t *testing.T) {
 
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 
 	if err := c.evictNodeToDisk(leaf); err != nil {
 		t.Fatal("evictNodeToDisk:", err)
@@ -936,11 +876,7 @@ func TestLoadNodeFromDiskWaitsForInFlight(t *testing.T) {
 
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 
 	// Evict (async write is now in-flight).
 	if err := c.evictNodeToDisk(leaf); err != nil {
@@ -969,11 +905,7 @@ func TestLazyLoadTrieRoundTrip(t *testing.T) {
 	c := makeTestKVCache(t, numLayers)
 	feedTokens(c, 3)
 	child := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	child.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, child, 0)
 	c.activePath = []*trieNode{c.root, child}
 
 	if err := saveTrieTo(c, dir, modelID); err != nil {
@@ -1022,11 +954,7 @@ func TestLazyLoadTrieMissingFile(t *testing.T) {
 	c := makeTestKVCache(t, numLayers)
 	feedTokens(c, 3)
 	child := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	child.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, child, 0)
 	c.activePath = []*trieNode{c.root, child}
 
 	if err := saveTrieTo(c, dir, modelID); err != nil {
@@ -1069,11 +997,7 @@ func TestShutdownDrainsAsyncWrites(t *testing.T) {
 	for i := range 3 {
 		feedTokens(c, 2)
 		leaf := c.root.appendTokens(c.root, []int32{int32(i*2 + 1), int32(i*2 + 2)}, 2)
-		snaps := make([]cache.Snapshot, numLayers)
-		for j, kv := range c.caches {
-			snaps[j] = kv.Snapshot(0)
-		}
-		leaf.setSnapshots(snaps, &c.pagedOutBytes)
+		takeSnapshots(c, leaf, 0)
 		leaves = append(leaves, leaf)
 	}
 
@@ -1104,11 +1028,7 @@ func TestWarmCacheKeepsFile(t *testing.T) {
 
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 
 	if err := c.evictNodeToDisk(leaf); err != nil {
 		t.Fatal(err)
@@ -1141,11 +1061,7 @@ func TestFastReEvictionFromWarmCache(t *testing.T) {
 
 	feedTokens(c, 3)
 	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snaps := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snaps[j] = kv.Snapshot(0)
-	}
-	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	takeSnapshots(c, leaf, 0)
 
 	// Evict, then load (creates warm cache file).
 	if err := c.evictNodeToDisk(leaf); err != nil {
@@ -1195,19 +1111,11 @@ func TestFullLifecycleAsyncAndWarmCache(t *testing.T) {
 
 	feedTokens(c, 3)
 	branchA := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
-	snapsA := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snapsA[j] = kv.Snapshot(0)
-	}
-	branchA.setSnapshots(snapsA, &c.pagedOutBytes)
+	takeSnapshots(c, branchA, 0)
 
 	feedTokens(c, 3)
 	branchB := c.root.appendTokens(c.root, []int32{4, 5, 6}, 3)
-	snapsB := make([]cache.Snapshot, numLayers)
-	for j, kv := range c.caches {
-		snapsB[j] = kv.Snapshot(0)
-	}
-	branchB.setSnapshots(snapsB, &c.pagedOutBytes)
+	takeSnapshots(c, branchB, 0)
 
 	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal("initial save:", err)

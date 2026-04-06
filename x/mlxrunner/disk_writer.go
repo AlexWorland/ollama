@@ -13,9 +13,8 @@ type diskWriteJob struct {
 }
 
 type diskWriteResult struct {
-	node     *trieNode
-	fileSize int64
-	err      error
+	node *trieNode
+	err  error
 }
 
 // diskWriter runs background goroutines that write pre-serialized bytes to
@@ -54,9 +53,8 @@ func (w *diskWriter) worker() {
 		}
 
 		w.results <- diskWriteResult{
-			node:     job.node,
-			fileSize: int64(len(job.data)),
-			err:      err,
+			node: job.node,
+			err:  err,
 		}
 	}
 }

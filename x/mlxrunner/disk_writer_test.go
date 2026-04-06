@@ -23,9 +23,6 @@ func TestDiskWriterWritesFile(t *testing.T) {
 	if result.err != nil {
 		t.Fatal("write failed:", result.err)
 	}
-	if result.fileSize != int64(len(data)) {
-		t.Fatalf("fileSize: got %d, want %d", result.fileSize, len(data))
-	}
 
 	got, err := os.ReadFile(filepath.Join(dir, "test.safetensors"))
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -350,11 +351,7 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	}
 
 	// Phase 1 (inference goroutine): materialize lazy tensors and serialize.
-	evalArrays := make([]*mlx.Array, 0, len(arrays))
-	for _, arr := range arrays {
-		evalArrays = append(evalArrays, arr)
-	}
-	mlx.Eval(evalArrays...)
+	mlx.Eval(slices.Collect(maps.Values(arrays))...)
 
 	data, err := mlx.SerializeSafetensors(arrays, metadata)
 	if err != nil {
@@ -386,10 +383,7 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 		tmpPath := filepath.Join(c.cacheDir, ".tmp_"+filename)
 		finalPath := filepath.Join(c.cacheDir, filename)
 		if err := atomicWriteFile(tmpPath, finalPath, data); err != nil {
-			c.totalDiskBytes -= int64(len(data))
-			node.diskFile = ""
-			node.diskFileSize = 0
-			node.snapTypes = nil
+			c.clearNodeDiskState(node)
 			return fmt.Errorf("write evicted node: %w", err)
 		}
 	}
@@ -483,10 +477,7 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 			"path", filepath.Base(e.node.diskFile))
 		c.emitEvent(EventEvictFromDisk, e.node, e.size, filepath.Base(e.node.diskFile))
 		os.Remove(e.node.diskFile)
-		e.node.diskFile = ""
-		e.node.diskFileSize = 0
-		e.node.snapTypes = nil
-		c.totalDiskBytes -= e.size
+		c.clearNodeDiskState(e.node)
 
 		if len(e.node.children) == 0 {
 			removeNode(e.node, &c.pagedOutBytes)
@@ -507,10 +498,7 @@ func (c *kvCache) processDiskCompletions() {
 			if result.err != nil {
 				slog.Warn("async disk write failed", "error", result.err,
 					"file", filepath.Base(result.node.diskFile))
-				c.totalDiskBytes -= result.node.diskFileSize
-				result.node.diskFile = ""
-				result.node.diskFileSize = 0
-				result.node.snapTypes = nil
+				c.clearNodeDiskState(result.node)
 				if len(result.node.children) == 0 {
 					removeNode(result.node, &c.pagedOutBytes)
 				}
@@ -519,6 +507,14 @@ func (c *kvCache) processDiskCompletions() {
 			return
 		}
 	}
+}
+
+// clearNodeDiskState undoes the optimistic disk state set by evictNodeToDisk.
+func (c *kvCache) clearNodeDiskState(node *trieNode) {
+	c.totalDiskBytes -= node.diskFileSize
+	node.diskFile = ""
+	node.diskFileSize = 0
+	node.snapTypes = nil
 }
 
 // snapshotTypes extracts the per-layer SnapshotType from live snapshots.
