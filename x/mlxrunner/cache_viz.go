@@ -116,7 +116,6 @@ func (b *cacheEventBus) emit(e CacheEvent) {
 	b.mu.Unlock()
 }
 
-// emitEvent is a convenience method that builds a CacheEvent from a trieNode.
 func (c *kvCache) emitEvent(typ CacheEventType, node *trieNode, bytes int64, diskFile string) {
 	if c.events == nil || c.events.count.Load() == 0 {
 		return
@@ -131,7 +130,6 @@ func (c *kvCache) emitEvent(typ CacheEventType, node *trieNode, bytes int64, dis
 	})
 }
 
-// rebuildSnapshot builds and atomically stores a new TrieSnapshot.
 // Called from the trie goroutine after mutations.
 func (c *kvCache) rebuildSnapshot() {
 	if c.events == nil {
@@ -143,7 +141,6 @@ func (c *kvCache) rebuildSnapshot() {
 // ---------------- Snapshot builder ----------------
 
 // buildTrieSnapshot walks the trie and produces a structured snapshot.
-// Mirrors dumpTree() logic but returns data instead of logging.
 func (c *kvCache) buildTrieSnapshot() *TrieSnapshot {
 	// Compute active cache bytes from live arrays.
 	var cacheBytes int64
@@ -158,10 +155,7 @@ func (c *kvCache) buildTrieSnapshot() *TrieSnapshot {
 		}
 	}
 
-	activeSet := make(map[*trieNode]bool, len(c.activePath))
-	for _, n := range c.activePath {
-		activeSet[n] = true
-	}
+	activeSet := c.activeSet()
 
 	// Assign sequential IDs via depth-first walk.
 	nodeMap := make(map[*trieNode]int)

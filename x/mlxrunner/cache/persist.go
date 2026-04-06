@@ -108,20 +108,22 @@ func ImportSnapshot(typ SnapshotType, arrays map[string]*mlx.Array, meta map[str
 	}
 }
 
-func importKVSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {
+// importKVFields extracts and validates the keys/values/offsets shared by
+// kvSnapshot and rotatingSnapshot.
+func importKVFields(arrays map[string]*mlx.Array, meta map[string]string, label string) (*kvSnapshot, error) {
 	keys := arrays["keys"]
 	values := arrays["values"]
 	if keys == nil || values == nil {
-		return nil, fmt.Errorf("kv snapshot missing keys or values array")
+		return nil, fmt.Errorf("%s snapshot missing keys or values array", label)
 	}
 
 	fromOffset, err := strconv.Atoi(meta["from_offset"])
 	if err != nil {
-		return nil, fmt.Errorf("kv snapshot invalid from_offset: %w", err)
+		return nil, fmt.Errorf("%s snapshot invalid from_offset: %w", label, err)
 	}
 	toOffset, err := strconv.Atoi(meta["to_offset"])
 	if err != nil {
-		return nil, fmt.Errorf("kv snapshot invalid to_offset: %w", err)
+		return nil, fmt.Errorf("%s snapshot invalid to_offset: %w", label, err)
 	}
 
 	mlx.Pin(keys, values)
@@ -135,38 +137,20 @@ func importKVSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Sna
 	}, nil
 }
 
-func importRotatingSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {
-	keys := arrays["keys"]
-	values := arrays["values"]
-	if keys == nil || values == nil {
-		return nil, fmt.Errorf("rotating snapshot missing keys or values array")
-	}
+func importKVSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {
+	return importKVFields(arrays, meta, "kv")
+}
 
-	fromOffset, err := strconv.Atoi(meta["from_offset"])
+func importRotatingSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {
+	base, err := importKVFields(arrays, meta, "rotating")
 	if err != nil {
-		return nil, fmt.Errorf("rotating snapshot invalid from_offset: %w", err)
-	}
-	toOffset, err := strconv.Atoi(meta["to_offset"])
-	if err != nil {
-		return nil, fmt.Errorf("rotating snapshot invalid to_offset: %w", err)
+		return nil, err
 	}
 	idx, err := strconv.Atoi(meta["idx"])
 	if err != nil {
 		return nil, fmt.Errorf("rotating snapshot invalid idx: %w", err)
 	}
-
-	mlx.Pin(keys, values)
-	mlx.AsyncEval(keys, values)
-
-	return &rotatingSnapshot{
-		kvSnapshot: kvSnapshot{
-			keys:       keys,
-			values:     values,
-			fromOffset: fromOffset,
-			toOffset:   toOffset,
-		},
-		idx: idx,
-	}, nil
+	return &rotatingSnapshot{kvSnapshot: *base, idx: idx}, nil
 }
 
 func importRecurrentSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {

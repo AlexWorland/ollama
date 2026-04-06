@@ -99,11 +99,12 @@ func (c *kvCache) captureActiveFrontier() {
 	frontier.setSnapshots(snaps, &c.pagedOutBytes)
 }
 
-// saveTrie serializes the trie topology and all snapshot data to cacheDir.
 // Files are named by a SHA-256 hash of each node's cumulative token path,
 // making writes idempotent and crash-safe: writing <hashA>.safetensors can
 // never overwrite <hashB>.safetensors (different paths = different hashes).
-func (c *kvCache) saveTrie(cacheDir, modelID string) error {
+func (c *kvCache) saveTrie() error {
+	cacheDir := c.cacheDir
+	modelID := c.modelID
 	if c.root == nil {
 		return nil
 	}
@@ -307,7 +308,6 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, map[st
 	return root, pagedOutBytes, referenced, nil
 }
 
-// closeSnapshots closes all non-nil snapshots in the slice.
 func closeSnapshots(snaps []cache.Snapshot) {
 	for _, s := range snaps {
 		if s != nil {
@@ -362,10 +362,9 @@ func exportNodeSnapshots(snapshots []cache.Snapshot) (map[string]*mlx.Array, map
 	return arrays, metadata, snapTypes
 }
 
-// evictNodeToDisk serializes a node's snapshots to a safetensors file on disk,
-// then nils the in-memory snapshots. The node remains in the trie with diskFile
-// set so it can be reloaded on demand. The file is named by a content-addressable
-// hash so saveTrie can reference it without renaming.
+// The node remains in the trie with diskFile set so it can be reloaded on
+// demand. The file is content-addressed so saveTrie can reference it without
+// renaming.
 func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	if c.cacheDir == "" {
 		return fmt.Errorf("cacheDir not set")
@@ -393,11 +392,9 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 
 	c.emitEvent(EventEvictToDisk, node, fileSize, filename)
 	c.enforceDiskEvictionPolicy()
-	c.rebuildSnapshot()
 	return nil
 }
 
-// loadNodeFromDisk reloads a disk-evicted node's snapshots from its safetensors file.
 func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	sf, err := mlx.LoadSafetensorsNative(node.diskFile)
 	if err != nil {
@@ -437,12 +434,10 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	node.diskFileSize = 0
 
 	node.setSnapshots(snaps, &c.pagedOutBytes)
-	c.rebuildSnapshot()
 	return nil
 }
 
-// enforceDiskEvictionPolicy deletes the oldest disk-backed nodes when total
-// disk usage exceeds OLLAMA_KV_CACHE_DISK_MAX. No-op when the cap is 0 (unlimited).
+// No-op when the cap is 0 (unlimited).
 func (c *kvCache) enforceDiskEvictionPolicy() {
 	diskCap := int64(envconfig.KvCacheDiskMax())
 	if diskCap <= 0 {
@@ -455,10 +450,7 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 		return
 	}
 
-	activeSet := make(map[*trieNode]bool, len(c.activePath))
-	for _, n := range c.activePath {
-		activeSet[n] = true
-	}
+	activeSet := c.activeSet()
 
 	// Walk to find eviction candidates (only needed when over cap).
 	type diskEntry struct {
@@ -498,8 +490,7 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 	}
 }
 
-// cleanUnreferencedFiles removes any .safetensors files in dir not in the
-// referenced set. Called after writing trie.json and on startup after loadTrie.
+// Called after writing trie.json and on startup after loadTrie.
 func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -513,8 +504,7 @@ func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	}
 }
 
-// atomicSaveSafetensors writes a safetensors file via tmp+rename to prevent
-// partial writes on crash. Returns the file size on success.
+// Returns the file size on success.
 func atomicSaveSafetensors(dir, filename string, arrays map[string]*mlx.Array, metadata map[string]string) (int64, error) {
 	// Use a .tmp_ prefix (not suffix) so the file retains the .safetensors
 	// extension that the MLX C library expects.
@@ -541,7 +531,7 @@ func atomicSaveSafetensors(dir, filename string, arrays map[string]*mlx.Array, m
 	return fileSize, nil
 }
 
-// atomicWriteFile writes data via tmp+rename to prevent partial writes on crash.
+// atomicWriteFile writes data via tmp+rename for crash safety.
 func atomicWriteFile(tmpPath, finalPath string, data []byte) error {
 	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {

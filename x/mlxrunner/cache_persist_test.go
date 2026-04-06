@@ -11,6 +11,13 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
+// saveTrieTo is a test helper that sets cacheDir/modelID and calls saveTrie.
+func saveTrieTo(c *kvCache, dir, modelID string) error {
+	c.cacheDir = dir
+	c.modelID = modelID
+	return c.saveTrie()
+}
+
 func skipIfNoMLXTest(t *testing.T) {
 	t.Helper()
 	if err := mlx.CheckInit(); err != nil {
@@ -80,7 +87,7 @@ func TestSaveLoadTrieRoundTrip(t *testing.T) {
 	}
 
 	// Save.
-	if err := c.saveTrie(dir, modelID); err != nil {
+	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal("saveTrie:", err)
 	}
 
@@ -170,7 +177,7 @@ func TestLoadTrieModelMismatch(t *testing.T) {
 	}
 	child.setSnapshots(snaps, &c.pagedOutBytes)
 
-	if err := c.saveTrie(dir, "sha256:model_a"); err != nil {
+	if err := saveTrieTo(c, dir, "sha256:model_a"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -200,7 +207,7 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 	}
 	child.setSnapshots(snaps, &c.pagedOutBytes)
 
-	if err := c.saveTrie(dir, modelID); err != nil {
+	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -232,7 +239,7 @@ func TestSaveTrieEmptyCache(t *testing.T) {
 	c := &kvCache{}
 	dir := t.TempDir()
 	// Should succeed silently with no root.
-	if err := c.saveTrie(dir, "sha256:test"); err != nil {
+	if err := saveTrieTo(c, dir, "sha256:test"); err != nil {
 		t.Fatal(err)
 	}
 	// No trie.json should be created.
@@ -248,7 +255,7 @@ func TestSaveTrieRootOnly(t *testing.T) {
 	c.activePath = []*trieNode{c.root}
 	dir := t.TempDir()
 	// Root-only trie should not be saved (nothing useful).
-	if err := c.saveTrie(dir, "sha256:test"); err != nil {
+	if err := saveTrieTo(c, dir, "sha256:test"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "trie.json")); !os.IsNotExist(err) {
@@ -315,7 +322,7 @@ func TestSaveLoadBranchingTrie(t *testing.T) {
 	}
 	branchB.setSnapshots(branchBSnaps, &c.pagedOutBytes)
 
-	if err := c.saveTrie(dir, modelID); err != nil {
+	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -567,7 +574,7 @@ func TestSaveTrieWithColdNodes(t *testing.T) {
 	}
 
 	// Save trie — cold node file is already hash-named, no rename needed.
-	if err := c.saveTrie(dir, modelID); err != nil {
+	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal("saveTrie:", err)
 	}
 
@@ -750,7 +757,7 @@ func TestIncrementalSaveSkipsColdNodes(t *testing.T) {
 	}
 
 	// Save trie — cold node should NOT be rewritten.
-	if err := c.saveTrie(dir, modelID); err != nil {
+	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -783,7 +790,7 @@ func TestCrashSafetyPartialSave(t *testing.T) {
 	child.setSnapshots(snaps, &c.pagedOutBytes)
 	c.activePath = []*trieNode{c.root, child}
 
-	if err := c.saveTrie(dir, modelID); err != nil {
+	if err := saveTrieTo(c, dir, modelID); err != nil {
 		t.Fatal(err)
 	}
 

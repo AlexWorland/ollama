@@ -58,10 +58,8 @@ func Execute(args []string) error {
 		return err
 	}
 
-	// Restore cached KV trie from a previous session.
 	runner.restoreCache()
 
-	// Initialize visualization infrastructure and capture initial snapshot.
 	runner.cache.events = newCacheEventBus()
 	runner.cache.rebuildSnapshot()
 
@@ -232,7 +230,6 @@ func (w *statusRecorder) Flush() {
 	}
 }
 
-// restoreCache loads a previously saved KV cache trie from disk.
 func (r *Runner) restoreCache() {
 	if r.modelDigest == "" {
 		return
@@ -275,13 +272,12 @@ func (r *Runner) restoreCache() {
 	slog.Info("restored KV cache from disk", "paged_out", mlx.PrettyBytes(int(pagedOut)))
 }
 
-// saveCache writes the current KV cache trie to disk.
 func (r *Runner) saveCache() {
 	if r.cache.root == nil || r.cache.cacheDir == "" {
 		return
 	}
 
-	if err := r.cache.saveTrie(r.cache.cacheDir, r.cache.modelID); err != nil {
+	if err := r.cache.saveTrie(); err != nil {
 		slog.Error("failed to save KV cache", "error", err)
 	}
 }

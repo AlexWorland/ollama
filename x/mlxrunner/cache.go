@@ -33,9 +33,9 @@ import (
 
 const maxPagedOutBytes int64 = 8 << 30 // 8 GiB eviction threshold for paged-out snapshot memory
 
-// kvCache manages the trie-based KV attention cache. All methods are called
-// from the single request-processing goroutine in Runner.Run (via the
-// Requests channel). No concurrent access protection is needed.
+// All methods are called from the single request-processing goroutine in
+// Runner.Run (via the Requests channel). No concurrent access protection
+// is needed.
 type kvCache struct {
 	root          *trieNode   // root of the prefix trie
 	activePath    []*trieNode // current root→leaf path with live MLX arrays
@@ -50,6 +50,14 @@ type kvCache struct {
 	// Visualization (safe for cross-goroutine reads via atomic/bus).
 	events       *cacheEventBus
 	trieSnapshot atomic.Pointer[TrieSnapshot]
+}
+
+func (c *kvCache) activeSet() map[*trieNode]bool {
+	s := make(map[*trieNode]bool, len(c.activePath))
+	for _, n := range c.activePath {
+		s[n] = true
+	}
+	return s
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.
@@ -494,7 +502,11 @@ func (s *cacheSession) close() {
 		c.activePath[len(c.activePath)-1].lastUsed = time.Now()
 	}
 
-	s.cache.rebuildSnapshot()
+	// Skip the full trie walk when no SSE subscribers are connected —
+	// the common case during normal inference.
+	if c.events != nil && c.events.count.Load() > 0 {
+		c.rebuildSnapshot()
+	}
 }
 
 // enforceEvictionPolicy evicts eligible nodes until paged-out memory is within limits.
@@ -503,10 +515,7 @@ func (c *kvCache) enforceEvictionPolicy() {
 		return
 	}
 
-	activeSet := make(map[*trieNode]bool, len(c.activePath))
-	for _, n := range c.activePath {
-		activeSet[n] = true
-	}
+	activeSet := c.activeSet()
 
 	// Collect all candidates in one walk and sort once (oldest, deepest,
 	// largest) instead of re-walking per eviction.
@@ -581,11 +590,7 @@ func (c *kvCache) dumpTree() {
 		}
 	}
 
-	// Build active path set for marking.
-	active := make(map[*trieNode]bool, len(c.activePath))
-	for _, n := range c.activePath {
-		active[n] = true
-	}
+	active := c.activeSet()
 
 	var nodeCount, snapshotCount int
 	var pagedBytes int64
