@@ -118,7 +118,7 @@ func (b *cacheEventBus) emit(e CacheEvent) {
 
 // emitEvent is a convenience method that builds a CacheEvent from a trieNode.
 func (c *kvCache) emitEvent(typ CacheEventType, node *trieNode, bytes int64, diskFile string) {
-	if c.events == nil {
+	if c.events == nil || c.events.count.Load() == 0 {
 		return
 	}
 	c.events.emit(CacheEvent{
@@ -328,9 +328,11 @@ func (c *kvCache) handleCacheEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Send current snapshot as initial state.
+	// Send current snapshot as initial state. Uses "init" (not "snapshot")
+	// because EventSnapshot emits CacheEvent payloads through the bus,
+	// which have a different schema than the TrieSnapshot sent here.
 	if snap := c.trieSnapshot.Load(); snap != nil {
-		writeSSE(w, "snapshot", snap)
+		writeSSE(w, "init", snap)
 	}
 
 	ch, unsub := c.events.subscribe()
@@ -585,12 +587,12 @@ fetch('/v1/cache/trie').then(function(r) { return r.json(); }).then(function(sna
 });
 
 var es = new EventSource('/v1/cache/events');
-es.addEventListener('snapshot', function(e) {
+es.addEventListener('init', function(e) {
   var snap = JSON.parse(e.data);
   renderStats(snap.stats || {});
   renderTrie(snap);
 });
-['page_out','page_in','page_in_disk','evict_to_disk','evict_from_disk'].forEach(function(t) {
+['page_out','page_in','page_in_disk','evict_to_disk','evict_from_disk','snapshot'].forEach(function(t) {
   es.addEventListener(t, function(e) { handleEvent(JSON.parse(e.data)); });
 });
 

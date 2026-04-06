@@ -1,6 +1,7 @@
 package mlxrunner
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -385,7 +386,7 @@ func TestHandleCacheEventsSSE(t *testing.T) {
 
 	// Start the handler in a goroutine since it blocks.
 	req := httptest.NewRequest("GET", "/v1/cache/events", nil)
-	ctx, cancel := newTestContext()
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req = req.WithContext(ctx)
 	w := httptest.NewRecorder()
@@ -420,8 +421,8 @@ func TestHandleCacheEventsSSE(t *testing.T) {
 	<-done
 
 	body := w.Body.String()
-	if !strings.Contains(body, "event: snapshot") {
-		t.Error("SSE stream should start with initial snapshot event")
+	if !strings.Contains(body, "event: init") {
+		t.Error("SSE stream should start with initial init event")
 	}
 	if !strings.Contains(body, "event: page_out") {
 		t.Error("SSE stream should contain page_out event")
@@ -442,28 +443,3 @@ func containsFlag(flags []string, flag string) bool {
 	return false
 }
 
-// newTestContext creates a cancellable context for SSE tests.
-func newTestContext() (ctx interface{ Done() <-chan struct{}; Err() error; Deadline() (time.Time, bool); Value(any) any }, cancel func()) {
-	type contextLike interface {
-		Done() <-chan struct{}
-		Err() error
-		Deadline() (time.Time, bool)
-		Value(any) any
-	}
-	ch := make(chan struct{})
-	cancelled := false
-	cancelFn := func() {
-		if !cancelled {
-			cancelled = true
-			close(ch)
-		}
-	}
-	return &testCtx{done: ch}, cancelFn
-}
-
-type testCtx struct{ done chan struct{} }
-
-func (c *testCtx) Done() <-chan struct{}        { return c.done }
-func (c *testCtx) Err() error                   { select { case <-c.done: return http.ErrAbortHandler; default: return nil } }
-func (c *testCtx) Deadline() (time.Time, bool)  { return time.Time{}, false }
-func (c *testCtx) Value(any) any                { return nil }
