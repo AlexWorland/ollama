@@ -46,7 +46,8 @@ type kvCache struct {
 	// Disk-backed eviction state.
 	cacheDir       string // directory for persisted/evicted safetensors files
 	modelID        string // for validation on reload
-	totalDiskBytes int64  // running total of disk-backed node file sizes
+	totalDiskBytes int64       // running total of disk-backed node file sizes
+	diskWriter     *diskWriter // background writer for async eviction (nil in tests)
 
 	// Visualization (safe for cross-goroutine reads via atomic/bus).
 	events       *cacheEventBus
@@ -112,6 +113,7 @@ func (c *kvCache) ensureRoot() {
 func (c *kvCache) begin(m base.Model, inputs []int32) *cacheSession {
 	c.ensureCaches(m)
 	c.ensureRoot()
+	c.processDiskCompletions()
 
 	matchPath, matched := findBestMatch(c.root, inputs)
 	originalMatched := matched

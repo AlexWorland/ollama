@@ -479,6 +479,33 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 	}
 }
 
+// processDiskCompletions drains completed background writes, undoing
+// optimistic state for any failures. Called at the top of begin() on the
+// inference goroutine -- no concurrency concerns.
+func (c *kvCache) processDiskCompletions() {
+	if c.diskWriter == nil {
+		return
+	}
+	for {
+		select {
+		case result := <-c.diskWriter.results:
+			if result.err != nil {
+				slog.Warn("async disk write failed", "error", result.err,
+					"file", filepath.Base(result.node.diskFile))
+				c.totalDiskBytes -= result.node.diskFileSize
+				result.node.diskFile = ""
+				result.node.diskFileSize = 0
+				result.node.snapTypes = nil
+				if len(result.node.children) == 0 {
+					removeNode(result.node, &c.pagedOutBytes)
+				}
+			}
+		default:
+			return
+		}
+	}
+}
+
 func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
