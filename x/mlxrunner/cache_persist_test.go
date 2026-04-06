@@ -827,3 +827,84 @@ func TestCrashSafetyPartialSave(t *testing.T) {
 		t.Fatal("child should have snapshots")
 	}
 }
+
+func TestProcessDiskCompletionsOnFailure(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 1
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = t.TempDir()
+	c.diskWriter = newDiskWriter()
+	defer c.diskWriter.shutdown()
+
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	c.activePath = []*trieNode{c.root}
+
+	// Simulate a failed async write by injecting a failed result.
+	leaf.diskFile = filepath.Join(c.cacheDir, "fake.safetensors")
+	leaf.diskFileSize = 1000
+	leaf.snapTypes = []cache.SnapshotType{cache.SnapshotTypeKV}
+	leaf.setSnapshots(nil, &c.pagedOutBytes)
+	c.totalDiskBytes = 1000
+
+	c.diskWriter.results <- diskWriteResult{
+		node:     leaf,
+		fileSize: 1000,
+		err:      fmt.Errorf("simulated write failure"),
+	}
+
+	c.processDiskCompletions()
+
+	if leaf.diskFile != "" {
+		t.Fatal("diskFile should be cleared after failure")
+	}
+	if c.totalDiskBytes != 0 {
+		t.Fatalf("totalDiskBytes should be 0, got %d", c.totalDiskBytes)
+	}
+	if len(c.root.children) != 0 {
+		t.Fatal("leaf should be removed from trie after failure")
+	}
+}
+
+func TestAsyncEvictNodeToDisk(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 2
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = t.TempDir()
+	c.diskWriter = newDiskWriter()
+	defer c.diskWriter.shutdown()
+
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal("evictNodeToDisk:", err)
+	}
+
+	if leaf.diskFile == "" {
+		t.Fatal("diskFile should be set immediately")
+	}
+	if leaf.hasSnapshots() {
+		t.Fatal("snapshots should be nil")
+	}
+
+	// Wait for background write.
+	c.diskWriter.waitForFile(filepath.Base(leaf.diskFile))
+	<-c.diskWriter.results
+
+	if _, err := os.Stat(leaf.diskFile); err != nil {
+		t.Fatal("file should exist after async write:", err)
+	}
+}

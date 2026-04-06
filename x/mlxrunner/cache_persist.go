@@ -360,28 +360,59 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	if c.cacheDir == "" {
 		return fmt.Errorf("cacheDir not set")
 	}
-	arrays, metadata, snapTypes := exportNodeSnapshots(node.snapshots)
 
+	arrays, metadata, snapTypes := exportNodeSnapshots(node.snapshots)
 	if len(arrays) == 0 {
 		return fmt.Errorf("no arrays to evict")
 	}
 
-	filename := nodeFileHash(node)
-	fileSize, err := atomicSaveSafetensors(c.cacheDir, filename, arrays, metadata)
-	if err != nil {
-		return fmt.Errorf("save evicted node: %w", err)
+	// Phase 1 (inference goroutine): materialize lazy tensors and serialize.
+	evalArrays := make([]*mlx.Array, 0, len(arrays))
+	for _, arr := range arrays {
+		evalArrays = append(evalArrays, arr)
 	}
+	mlx.Eval(evalArrays...)
+
+	data, err := mlx.SerializeSafetensors(arrays, metadata)
+	if err != nil {
+		return fmt.Errorf("serialize evicted node: %w", err)
+	}
+
+	filename := nodeFileHash(node)
 
 	slog.Info("evicting node to disk", "offset", node.startOffset(),
 		"tokens", len(node.tokens), "bytes", node.snapshotBytes(), "path", filename)
 
+	// Set disk state optimistically -- corrected on failure by processDiskCompletions.
 	node.snapTypes = snapTypes
 	node.diskFile = filepath.Join(c.cacheDir, filename)
-	node.diskFileSize = fileSize
+	node.diskFileSize = int64(len(data))
 	node.setSnapshots(nil, &c.pagedOutBytes)
-	c.totalDiskBytes += fileSize
+	c.totalDiskBytes += int64(len(data))
 
-	c.emitEvent(EventEvictToDisk, node, fileSize, filename)
+	c.emitEvent(EventEvictToDisk, node, int64(len(data)), filename)
+
+	// Phase 2: write bytes to file.
+	if c.diskWriter != nil {
+		c.diskWriter.submit(diskWriteJob{
+			data:     data,
+			filename: filename,
+			dir:      c.cacheDir,
+			node:     node,
+		})
+	} else {
+		// Synchronous fallback (tests without diskWriter).
+		tmpPath := filepath.Join(c.cacheDir, ".tmp_"+filename)
+		finalPath := filepath.Join(c.cacheDir, filename)
+		if err := atomicWriteFile(tmpPath, finalPath, data); err != nil {
+			c.totalDiskBytes -= int64(len(data))
+			node.diskFile = ""
+			node.diskFileSize = 0
+			node.snapTypes = nil
+			return fmt.Errorf("write evicted node: %w", err)
+		}
+	}
+
 	return nil
 }
 
