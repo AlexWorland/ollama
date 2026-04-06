@@ -942,3 +942,41 @@ func TestLoadNodeFromDiskWaitsForInFlight(t *testing.T) {
 
 	<-c.diskWriter.results // drain
 }
+
+func TestShutdownDrainsAsyncWrites(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 1
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = t.TempDir()
+	c.diskWriter = newDiskWriter()
+
+	var leaves []*trieNode
+	for i := range 3 {
+		feedTokens(c, 2)
+		leaf := c.root.appendTokens(c.root, []int32{int32(i*2 + 1), int32(i*2 + 2)}, 2)
+		snaps := make([]cache.Snapshot, numLayers)
+		for j, kv := range c.caches {
+			snaps[j] = kv.Snapshot(0)
+		}
+		leaf.setSnapshots(snaps, &c.pagedOutBytes)
+		leaves = append(leaves, leaf)
+	}
+
+	c.activePath = []*trieNode{c.root}
+	for _, leaf := range leaves {
+		if err := c.evictNodeToDisk(leaf); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Shutdown: close -> wait -> drain.
+	c.diskWriter.shutdown()
+	c.processDiskCompletions()
+
+	for _, leaf := range leaves {
+		if _, err := os.Stat(leaf.diskFile); err != nil {
+			t.Fatalf("file should exist after shutdown: %v", err)
+		}
+	}
+}

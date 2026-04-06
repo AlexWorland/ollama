@@ -248,6 +248,7 @@ func (r *Runner) restoreCache() {
 	// even when no prior cache is restored.
 	r.cache.cacheDir = dir
 	r.cache.modelID = r.modelDigest
+	r.cache.diskWriter = newDiskWriter()
 
 	root, pagedOut, referenced, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
 	if err != nil {
@@ -275,6 +276,12 @@ func (r *Runner) restoreCache() {
 func (r *Runner) saveCache() {
 	if r.cache.root == nil || r.cache.cacheDir == "" {
 		return
+	}
+
+	// Drain all pending async writes before saving trie.
+	if r.cache.diskWriter != nil {
+		r.cache.diskWriter.shutdown()
+		r.cache.processDiskCompletions()
 	}
 
 	if err := r.cache.saveTrie(); err != nil {
