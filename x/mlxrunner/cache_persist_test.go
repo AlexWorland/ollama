@@ -1094,3 +1094,40 @@ func TestShutdownDrainsAsyncWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestWarmCacheKeepsFile(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 1
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = t.TempDir()
+
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+	diskPath := leaf.diskFile
+
+	if err := c.loadNodeFromDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm cache: file should still exist on disk.
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatal("warm cache file should still exist:", err)
+	}
+	// Node appears in-memory (diskFile cleared, not tracked in totalDiskBytes).
+	if leaf.diskFile != "" {
+		t.Fatal("diskFile should be cleared")
+	}
+	if c.totalDiskBytes != 0 {
+		t.Fatalf("totalDiskBytes should be 0, got %d", c.totalDiskBytes)
+	}
+}

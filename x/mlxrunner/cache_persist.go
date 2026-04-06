@@ -419,10 +419,8 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	slog.Info("loaded node from disk", "offset", node.startOffset(),
 		"tokens", len(node.tokens), "path", filepath.Base(node.diskFile))
 
-	// Clear disk state now that snapshots are back in memory. The on-disk
-	// file is no longer needed and would otherwise be orphaned.
+	// Keep file on disk as warm cache for fast re-eviction.
 	c.totalDiskBytes -= node.diskFileSize
-	os.Remove(node.diskFile)
 	node.diskFile = ""
 	node.diskFileSize = 0
 
