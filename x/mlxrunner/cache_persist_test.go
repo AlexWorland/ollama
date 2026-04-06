@@ -112,16 +112,16 @@ func TestSaveLoadTrieRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Load into a fresh trie.
-	root, pagedOut, _, err := loadTrie(dir, modelID, numLayers)
+	// Load lazily.
+	root, _, diskBytes, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
 	if root == nil {
 		t.Fatal("loadTrie returned nil root")
 	}
-	if pagedOut == 0 {
-		t.Fatal("expected non-zero paged out bytes after load")
+	if diskBytes <= 0 {
+		t.Fatal("expected positive disk bytes after lazy load")
 	}
 
 	// Verify topology.
@@ -135,8 +135,9 @@ func TestSaveLoadTrieRoundTrip(t *testing.T) {
 	if restoredChild.endOffset != 3 {
 		t.Fatalf("child endOffset: got %d, want 3", restoredChild.endOffset)
 	}
-	if !restoredChild.hasAllSnapshots() {
-		t.Fatal("restored child should have all snapshots")
+	// Lazy: node should be on-disk, not in memory.
+	if restoredChild.diskFile == "" {
+		t.Fatal("child should have diskFile set (lazy)")
 	}
 
 	if len(restoredChild.children) != 1 {
@@ -149,11 +150,26 @@ func TestSaveLoadTrieRoundTrip(t *testing.T) {
 	if restoredGC.endOffset != 5 {
 		t.Fatalf("grandchild endOffset: got %d, want 5", restoredGC.endOffset)
 	}
+
+	// Verify on-demand loading works.
+	c2 := &kvCache{cacheDir: dir, totalDiskBytes: diskBytes}
+	c2.caches = make([]cache.Cache, numLayers)
+	for i := range c2.caches {
+		c2.caches[i] = cache.NewKVCache()
+	}
+	if err := c2.loadNodeFromDisk(restoredChild); err != nil {
+		t.Fatal("loadNodeFromDisk child:", err)
+	}
+	if !restoredChild.hasAllSnapshots() {
+		t.Fatal("child should have snapshots after on-demand load")
+	}
+	if err := c2.loadNodeFromDisk(restoredGC); err != nil {
+		t.Fatal("loadNodeFromDisk grandchild:", err)
+	}
 	if !restoredGC.hasAllSnapshots() {
-		t.Fatal("restored grandchild should have all snapshots")
+		t.Fatal("grandchild should have snapshots after on-demand load")
 	}
 
-	// Parent pointer should be correct.
 	if restoredGC.parent != restoredChild {
 		t.Fatal("grandchild parent should be child")
 	}
@@ -182,7 +198,7 @@ func TestLoadTrieModelMismatch(t *testing.T) {
 	}
 
 	// Loading with a different model ID should return nil root.
-	root, _, _, err := loadTrie(dir, "sha256:model_b", numLayers)
+	root, _, _, _, err := loadTrie(dir, "sha256:model_b", numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +228,7 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 	}
 
 	// Loading with different layer count should return nil root.
-	root, _, _, err := loadTrie(dir, modelID, 4)
+	root, _, _, _, err := loadTrie(dir, modelID, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +239,7 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 
 func TestLoadTrieNoFile(t *testing.T) {
 	dir := t.TempDir()
-	root, pagedOut, _, err := loadTrie(dir, "sha256:test", 2)
+	root, pagedOut, _, _, err := loadTrie(dir, "sha256:test", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +342,7 @@ func TestSaveLoadBranchingTrie(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, _, _, err := loadTrie(dir, modelID, numLayers)
+	root, _, _, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,8 +599,8 @@ func TestSaveTrieWithColdNodes(t *testing.T) {
 		t.Fatal("evicted file should still exist (same hash name):", err)
 	}
 
-	// Load and verify the cold node round-trips.
-	root, _, _, err := loadTrie(dir, modelID, numLayers)
+	// Load and verify the cold node round-trips (lazy: diskFile set, no snapshots).
+	root, _, _, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
@@ -599,8 +615,8 @@ func TestSaveTrieWithColdNodes(t *testing.T) {
 	if len(restored.tokens) != 3 || restored.tokens[0] != 1 {
 		t.Fatalf("token mismatch: %v", restored.tokens)
 	}
-	if !restored.hasAllSnapshots() {
-		t.Fatal("cold node should have snapshots after load")
+	if restored.diskFile == "" {
+		t.Fatal("cold node should have diskFile set (lazy)")
 	}
 }
 
@@ -802,15 +818,15 @@ func TestCrashSafetyPartialSave(t *testing.T) {
 	}
 
 	// Load should succeed (old trie.json + old hash files are consistent).
-	root, pagedOut, referenced, err := loadTrie(dir, modelID, numLayers)
+	root, pagedOut, _, referenced, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
 	if root == nil {
 		t.Fatal("nil root — crash should not corrupt existing save")
 	}
-	if pagedOut == 0 {
-		t.Fatal("expected non-zero paged out bytes")
+	if pagedOut != 0 {
+		t.Fatal("lazy load should have 0 pagedOut")
 	}
 
 	// Cleanup should remove the orphan.
@@ -819,12 +835,12 @@ func TestCrashSafetyPartialSave(t *testing.T) {
 		t.Fatal("orphaned file should have been cleaned up")
 	}
 
-	// Original data should still be loadable.
+	// Original data should still be loadable (lazy: diskFile set).
 	if len(root.children) != 1 {
 		t.Fatalf("expected 1 child, got %d", len(root.children))
 	}
-	if !root.children[0].hasAllSnapshots() {
-		t.Fatal("child should have snapshots")
+	if root.children[0].diskFile == "" {
+		t.Fatal("child should have diskFile set (lazy)")
 	}
 }
 
@@ -941,6 +957,104 @@ func TestLoadNodeFromDiskWaitsForInFlight(t *testing.T) {
 	}
 
 	<-c.diskWriter.results // drain
+}
+
+func TestLazyLoadTrieRoundTrip(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	dir := t.TempDir()
+	modelID := "sha256:lazy-test"
+	numLayers := 2
+
+	c := makeTestKVCache(t, numLayers)
+	feedTokens(c, 3)
+	child := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	child.setSnapshots(snaps, &c.pagedOutBytes)
+	c.activePath = []*trieNode{c.root, child}
+
+	if err := saveTrieTo(c, dir, modelID); err != nil {
+		t.Fatal(err)
+	}
+
+	root, pagedOut, diskBytes, referenced, err := loadTrie(dir, modelID, numLayers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root == nil {
+		t.Fatal("nil root")
+	}
+	if pagedOut != 0 {
+		t.Fatalf("lazy load pagedOut should be 0, got %d", pagedOut)
+	}
+	if diskBytes <= 0 {
+		t.Fatalf("diskBytes should be positive, got %d", diskBytes)
+	}
+
+	restoredChild := root.children[0]
+	if restoredChild.diskFile == "" {
+		t.Fatal("child should have diskFile set (lazy)")
+	}
+	if restoredChild.diskFileSize == 0 {
+		t.Fatal("child should have diskFileSize set")
+	}
+	if restoredChild.snapTypes == nil {
+		t.Fatal("child should have snapTypes set")
+	}
+	if restoredChild.hasSnapshots() {
+		t.Fatal("child should NOT have snapshots (lazy)")
+	}
+	if len(referenced) == 0 {
+		t.Fatal("referenced set should not be empty")
+	}
+}
+
+func TestLazyLoadTrieMissingFile(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	dir := t.TempDir()
+	modelID := "sha256:missing-test"
+	numLayers := 1
+
+	c := makeTestKVCache(t, numLayers)
+	feedTokens(c, 3)
+	child := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	child.setSnapshots(snaps, &c.pagedOutBytes)
+	c.activePath = []*trieNode{c.root, child}
+
+	if err := saveTrieTo(c, dir, modelID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete safetensors files before loading.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".safetensors" {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+
+	root, _, diskBytes, _, err := loadTrie(dir, modelID, numLayers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root == nil {
+		t.Fatal("nil root")
+	}
+	if diskBytes != 0 {
+		t.Fatalf("diskBytes should be 0 for missing files, got %d", diskBytes)
+	}
+	restoredChild := root.children[0]
+	if restoredChild.diskFile != "" {
+		t.Fatal("missing file node should not have diskFile")
+	}
 }
 
 func TestShutdownDrainsAsyncWrites(t *testing.T) {

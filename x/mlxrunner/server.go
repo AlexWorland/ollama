@@ -250,14 +250,12 @@ func (r *Runner) restoreCache() {
 	r.cache.modelID = r.modelDigest
 	r.cache.diskWriter = newDiskWriter()
 
-	root, pagedOut, referenced, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
+	root, pagedOut, diskBytes, referenced, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
 	if err != nil {
 		slog.Warn("failed to load cached KV trie", "error", err)
 		return
 	}
 
-	// Remove orphaned .safetensors files not referenced by trie.json
-	// (left over from a crash during a previous session's save or eviction).
 	if referenced == nil {
 		referenced = make(map[string]bool)
 	}
@@ -270,7 +268,10 @@ func (r *Runner) restoreCache() {
 	r.cache.root = root
 	r.cache.activePath = []*trieNode{root}
 	r.cache.pagedOutBytes = pagedOut
-	slog.Info("restored KV cache from disk", "paged_out", mlx.PrettyBytes(int(pagedOut)))
+	r.cache.totalDiskBytes = diskBytes
+	slog.Info("restored KV cache from disk",
+		"paged_out", mlx.PrettyBytes(int(pagedOut)),
+		"disk_bytes", mlx.PrettyBytes(int(diskBytes)))
 }
 
 func (r *Runner) saveCache() {

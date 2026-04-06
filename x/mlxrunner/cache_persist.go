@@ -176,39 +176,40 @@ func (c *kvCache) saveTrie() error {
 	return nil
 }
 
-// loadTrie deserializes the trie from cacheDir. Returns the root node, total
-// paged-out bytes, and the set of referenced filenames (for cleanup). Returns
-// (nil, 0, nil, nil) if no cache exists or the version/model doesn't match.
-func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, map[string]bool, error) {
+// loadTrie deserializes the trie from cacheDir. Nodes with disk-backed files
+// are restored lazily: diskFile/diskFileSize/snapTypes are set from metadata,
+// but no safetensors files are opened. Actual loading happens on demand via
+// loadNodeFromDisk. Returns (root, pagedOutBytes=0, totalDiskBytes, referenced, error).
+func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, int64, map[string]bool, error) {
 	triePath := filepath.Join(cacheDir, "trie.json")
 	data, err := os.ReadFile(triePath)
 	if os.IsNotExist(err) {
-		return nil, 0, nil, nil
+		return nil, 0, 0, nil, nil
 	}
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("read trie.json: %w", err)
+		return nil, 0, 0, nil, fmt.Errorf("read trie.json: %w", err)
 	}
 
 	var persisted persistedTrie
 	if err := json.Unmarshal(data, &persisted); err != nil {
-		return nil, 0, nil, fmt.Errorf("parse trie.json: %w", err)
+		return nil, 0, 0, nil, fmt.Errorf("parse trie.json: %w", err)
 	}
 
 	if persisted.Version != trieFormatVersion {
 		slog.Info("ignoring cached trie: version mismatch", "file", persisted.Version, "expected", trieFormatVersion)
-		return nil, 0, nil, nil
+		return nil, 0, 0, nil, nil
 	}
 	if persisted.ModelID != modelID {
 		slog.Info("ignoring cached trie: model mismatch", "cached", persisted.ModelID, "current", modelID)
-		return nil, 0, nil, nil
+		return nil, 0, 0, nil, nil
 	}
 	if persisted.NumLayers != numLayers {
 		slog.Info("ignoring cached trie: layer count mismatch", "cached", persisted.NumLayers, "current", numLayers)
-		return nil, 0, nil, nil
+		return nil, 0, 0, nil, nil
 	}
 
 	if len(persisted.Nodes) == 0 {
-		return nil, 0, nil, nil
+		return nil, 0, 0, nil, nil
 	}
 
 	trieNodes := make([]*trieNode, len(persisted.Nodes))
@@ -217,14 +218,14 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, map[st
 			tokens:    pn.Tokens,
 			endOffset: pn.EndOffset,
 			user:      pn.User,
-			lastUsed:  time.Now(), // treat all restored nodes as recently used
+			lastUsed:  time.Now(),
 		}
 	}
 
 	for i, pn := range persisted.Nodes {
 		for _, childID := range pn.Children {
 			if childID < 0 || childID >= len(trieNodes) {
-				return nil, 0, nil, fmt.Errorf("node %d references invalid child %d", i, childID)
+				return nil, 0, 0, nil, fmt.Errorf("node %d references invalid child %d", i, childID)
 			}
 			child := trieNodes[childID]
 			child.parent = trieNodes[i]
@@ -232,14 +233,14 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, map[st
 		}
 	}
 
+	// Lazy loading: record disk state via os.Stat instead of reading files.
 	referenced := make(map[string]bool)
-	var pagedOutBytes int64
+	var totalDiskBytes int64
 	for i, pn := range persisted.Nodes {
 		if pn.File == "" || len(pn.SnapTypes) == 0 {
 			continue
 		}
 
-		// Validate hash matches the reconstructed node's token path.
 		expectedHash := nodeFileHash(trieNodes[i])
 		if pn.File != expectedHash {
 			slog.Warn("node file hash mismatch, skipping", "node", i,
@@ -247,56 +248,22 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, map[st
 			continue
 		}
 
-		referenced[pn.File] = true
-
 		nodePath := filepath.Join(cacheDir, pn.File)
-		sf, err := mlx.LoadSafetensorsNative(nodePath)
+		info, err := os.Stat(nodePath)
 		if err != nil {
-			slog.Warn("failed to load node snapshot, skipping", "node", i, "error", err)
+			slog.Warn("persisted node file missing, skipping", "node", i, "file", pn.File)
 			continue
 		}
 
-		snaps := make([]cache.Snapshot, numLayers)
-		var nodeBytes int64
-		allLoaded := true
-
-		for layer := 0; layer < numLayers; layer++ {
-			if layer >= len(pn.SnapTypes) || pn.SnapTypes[layer] == "" {
-				continue
-			}
-
-			snapType := pn.SnapTypes[layer]
-			arrays, meta := extractLayerData(sf, layer, snapType)
-			if len(arrays) == 0 {
-				slog.Warn("missing arrays for layer", "node", i, "layer", layer)
-				allLoaded = false
-				continue
-			}
-
-			snap, err := cache.ImportSnapshot(snapType, arrays, meta)
-			if err != nil {
-				slog.Warn("failed to import snapshot", "node", i, "layer", layer, "error", err)
-				allLoaded = false
-				continue
-			}
-
-			snaps[layer] = snap
-			nodeBytes += int64(snap.Size())
-		}
-
-		sf.Free()
-
-		if !allLoaded {
-			closeSnapshots(snaps)
-			continue
-		}
-
-		trieNodes[i].snapshots = snaps
-		pagedOutBytes += nodeBytes
+		referenced[pn.File] = true
+		trieNodes[i].diskFile = nodePath
+		trieNodes[i].diskFileSize = info.Size()
+		trieNodes[i].snapTypes = pn.SnapTypes
+		totalDiskBytes += info.Size()
 	}
 
 	root := trieNodes[0]
-	return root, pagedOutBytes, referenced, nil
+	return root, 0, totalDiskBytes, referenced, nil
 }
 
 func closeSnapshots(snaps []cache.Snapshot) {
