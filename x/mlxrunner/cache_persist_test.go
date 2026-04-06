@@ -908,3 +908,37 @@ func TestAsyncEvictNodeToDisk(t *testing.T) {
 		t.Fatal("file should exist after async write:", err)
 	}
 }
+
+func TestLoadNodeFromDiskWaitsForInFlight(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 2
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = t.TempDir()
+	c.diskWriter = newDiskWriter()
+	defer c.diskWriter.shutdown()
+
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+
+	// Evict (async write is now in-flight).
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+
+	// Immediately load -- should block until write completes, then succeed.
+	if err := c.loadNodeFromDisk(leaf); err != nil {
+		t.Fatal("loadNodeFromDisk should succeed after waiting:", err)
+	}
+
+	if !leaf.hasSnapshots() {
+		t.Fatal("snapshots should be restored")
+	}
+
+	<-c.diskWriter.results // drain
+}

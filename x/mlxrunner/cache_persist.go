@@ -417,6 +417,11 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 }
 
 func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
+	// Wait for in-flight async write before opening the file.
+	if c.diskWriter != nil {
+		c.diskWriter.waitForFile(filepath.Base(node.diskFile))
+	}
+
 	sf, err := mlx.LoadSafetensorsNative(node.diskFile)
 	if err != nil {
 		return fmt.Errorf("load %s: %w", node.diskFile, err)
