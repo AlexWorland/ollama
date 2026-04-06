@@ -328,6 +328,22 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 		return fmt.Errorf("cacheDir not set")
 	}
 
+	// Fast path: reuse warm cache file from a previous eviction.
+	filename := nodeFileHash(node)
+	warmPath := filepath.Join(c.cacheDir, filename)
+	if info, err := os.Stat(warmPath); err == nil {
+		slog.Info("fast re-eviction via warm cache", "offset", node.startOffset(),
+			"tokens", len(node.tokens), "path", filename)
+		node.snapTypes = snapshotTypes(node.snapshots)
+		node.diskFile = warmPath
+		node.diskFileSize = info.Size()
+		node.setSnapshots(nil, &c.pagedOutBytes)
+		c.totalDiskBytes += info.Size()
+		c.emitEvent(EventEvictToDisk, node, info.Size(), filename)
+		return nil
+	}
+
+	// Slow path: serialize + async write.
 	arrays, metadata, snapTypes := exportNodeSnapshots(node.snapshots)
 	if len(arrays) == 0 {
 		return fmt.Errorf("no arrays to evict")
@@ -344,8 +360,6 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	if err != nil {
 		return fmt.Errorf("serialize evicted node: %w", err)
 	}
-
-	filename := nodeFileHash(node)
 
 	slog.Info("evicting node to disk", "offset", node.startOffset(),
 		"tokens", len(node.tokens), "bytes", node.snapshotBytes(), "path", filename)
@@ -505,6 +519,17 @@ func (c *kvCache) processDiskCompletions() {
 			return
 		}
 	}
+}
+
+// snapshotTypes extracts the per-layer SnapshotType from live snapshots.
+func snapshotTypes(snapshots []cache.Snapshot) []cache.SnapshotType {
+	types := make([]cache.SnapshotType, len(snapshots))
+	for i, snap := range snapshots {
+		if exp := cache.ExportSnapshot(snap); exp != nil {
+			types[i] = exp.Type
+		}
+	}
+	return types
 }
 
 func cleanUnreferencedFiles(dir string, referenced map[string]bool) {

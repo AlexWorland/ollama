@@ -1131,3 +1131,54 @@ func TestWarmCacheKeepsFile(t *testing.T) {
 		t.Fatalf("totalDiskBytes should be 0, got %d", c.totalDiskBytes)
 	}
 }
+
+func TestFastReEvictionFromWarmCache(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 1
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = t.TempDir()
+
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+
+	// Evict, then load (creates warm cache file).
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+	warmFile := leaf.diskFile
+	warmInfo, _ := os.Stat(warmFile)
+
+	if err := c.loadNodeFromDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-evict — should use fast path.
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+
+	if leaf.diskFile == "" {
+		t.Fatal("diskFile should be set")
+	}
+	if leaf.hasSnapshots() {
+		t.Fatal("snapshots should be nil")
+	}
+
+	// File should NOT have been rewritten.
+	newInfo, err := os.Stat(leaf.diskFile)
+	if err != nil {
+		t.Fatal("warm file should exist:", err)
+	}
+	if !warmInfo.ModTime().Equal(newInfo.ModTime()) {
+		t.Fatal("file should not have been rewritten (fast re-eviction)")
+	}
+	if c.totalDiskBytes != newInfo.Size() {
+		t.Fatalf("totalDiskBytes: got %d, want %d", c.totalDiskBytes, newInfo.Size())
+	}
+}
