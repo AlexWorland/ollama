@@ -29,8 +29,12 @@ func nodeFileName(i int) string {
 	return fmt.Sprintf("%s%d%s", nodeFilePrefix, i, nodeFileSuffix)
 }
 
+// layerKey builds a safetensors key for a specific layer's field (e.g. "layer_3_keys").
+func layerKey(layer int, field string) string {
+	return fmt.Sprintf("layer_%d_%s", layer, field)
+}
+
 // persistedNode is the JSON-serializable form of a trieNode.
-// The node's ID is its index in the persistedTrie.Nodes slice.
 type persistedNode struct {
 	Tokens    []int32              `json:"tokens"`
 	EndOffset int                  `json:"end_offset"`
@@ -126,8 +130,7 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 			pn.SnapTypes = types
 
 			if len(arrays) > 0 {
-				path := filepath.Join(cacheDir, nodeFileName(i))
-				if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
+				if _, err := atomicSaveSafetensors(cacheDir, nodeFileName(i), arrays, metadata); err != nil {
 					return fmt.Errorf("save node %d: %w", i, err)
 				}
 			}
@@ -142,6 +145,7 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 				if copyErr := streamCopyFile(node.diskFile, destPath); copyErr != nil {
 					return fmt.Errorf("copy evicted node %d: %w", i, copyErr)
 				}
+				os.Remove(node.diskFile)
 			}
 			pn.SnapTypes = node.snapTypes
 		}
@@ -288,24 +292,21 @@ func closeSnapshots(snaps []cache.Snapshot) {
 	}
 }
 
-// extractLayerData pulls arrays and metadata for a specific layer from a
-// loaded safetensors file.
 func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.SnapshotType) (map[string]*mlx.Array, map[string]string) {
-	prefix := fmt.Sprintf("layer_%d_", layer)
 	arrays := make(map[string]*mlx.Array)
 	meta := make(map[string]string)
 
 	arrayNames, metaNames := snapType.FieldNames()
 
 	for _, name := range arrayNames {
-		arr := sf.Get(prefix + name)
+		arr := sf.Get(layerKey(layer, name))
 		if arr != nil {
 			arrays[name] = arr
 		}
 	}
 
 	for _, name := range metaNames {
-		val := sf.GetMetadata(prefix + name)
+		val := sf.GetMetadata(layerKey(layer, name))
 		if val != "" {
 			meta[name] = val
 		}
@@ -314,8 +315,6 @@ func extractLayerData(sf *mlx.SafetensorsFile, layer int, snapType cache.Snapsho
 	return arrays, meta
 }
 
-// exportNodeSnapshots builds layer-prefixed arrays and metadata maps from a
-// node's in-memory snapshots, ready for SaveSafetensorsWithMetadata.
 func exportNodeSnapshots(snapshots []cache.Snapshot) (map[string]*mlx.Array, map[string]string, []cache.SnapshotType) {
 	arrays := make(map[string]*mlx.Array)
 	metadata := make(map[string]string)
@@ -329,10 +328,10 @@ func exportNodeSnapshots(snapshots []cache.Snapshot) (map[string]*mlx.Array, map
 		snapTypes[li] = exp.Type
 
 		for name, arr := range exp.Arrays {
-			arrays[fmt.Sprintf("layer_%d_%s", li, name)] = arr
+			arrays[layerKey(li, name)] = arr
 		}
 		for key, val := range exp.Metadata {
-			metadata[fmt.Sprintf("layer_%d_%s", li, key)] = val
+			metadata[layerKey(li, key)] = val
 		}
 	}
 
@@ -353,27 +352,24 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	}
 
 	filename := fmt.Sprintf("%s%d%s", evictedFilePrefix, c.nextDiskID, nodeFileSuffix)
-	path := filepath.Join(c.cacheDir, filename)
-	if err := mlx.SaveSafetensorsWithMetadata(path, arrays, metadata); err != nil {
+	fileSize, err := atomicSaveSafetensors(c.cacheDir, filename, arrays, metadata)
+	if err != nil {
 		return fmt.Errorf("save evicted node: %w", err)
-	}
-
-	info, statErr := os.Stat(path)
-	var fileSize int64
-	if statErr == nil {
-		fileSize = info.Size()
 	}
 
 	slog.Info("evicting node to disk", "offset", node.startOffset(),
 		"tokens", len(node.tokens), "bytes", node.snapshotBytes(), "path", filename)
 
 	node.snapTypes = snapTypes
-	node.diskFile = path
+	node.diskFile = filepath.Join(c.cacheDir, filename)
 	node.diskFileSize = fileSize
 	node.setSnapshots(nil, &c.pagedOutBytes)
 	c.nextDiskID++
+	c.totalDiskBytes += fileSize
 
+	c.emitEvent(EventEvictToDisk, node, fileSize, filename)
 	c.enforceDiskEvictionPolicy()
+	c.rebuildSnapshot()
 	return nil
 }
 
@@ -409,7 +405,15 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	slog.Info("loaded node from disk", "offset", node.startOffset(),
 		"tokens", len(node.tokens), "path", filepath.Base(node.diskFile))
 
+	// Clear disk state now that snapshots are back in memory. The on-disk
+	// file is no longer needed and would otherwise be orphaned.
+	c.totalDiskBytes -= node.diskFileSize
+	os.Remove(node.diskFile)
+	node.diskFile = ""
+	node.diskFileSize = 0
+
 	node.setSnapshots(snaps, &c.pagedOutBytes)
+	c.rebuildSnapshot()
 	return nil
 }
 
@@ -421,29 +425,29 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 		return
 	}
 
+	// Fast path: totalDiskBytes is maintained incrementally, so we can
+	// skip the full trie walk when under cap (the common case).
+	if c.totalDiskBytes <= diskCap {
+		return
+	}
+
 	activeSet := make(map[*trieNode]bool, len(c.activePath))
 	for _, n := range c.activePath {
 		activeSet[n] = true
 	}
 
-	// Single walk: collect all eligible disk-backed nodes using cached sizes.
+	// Walk to find eviction candidates (only needed when over cap).
 	type diskEntry struct {
 		node *trieNode
 		size int64
 	}
 	var entries []diskEntry
-	var totalDiskBytes int64
 	walkNodes(c.root, func(n *trieNode) bool {
 		if n.diskFile != "" && !n.hasSnapshots() && !activeSet[n] {
 			entries = append(entries, diskEntry{n, n.diskFileSize})
-			totalDiskBytes += n.diskFileSize
 		}
 		return true
 	})
-
-	if totalDiskBytes <= diskCap {
-		return
-	}
 
 	// Sort oldest-first and delete until under cap.
 	slices.SortFunc(entries, func(a, b diskEntry) int {
@@ -451,17 +455,18 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 	})
 
 	for _, e := range entries {
-		if totalDiskBytes <= diskCap {
+		if c.totalDiskBytes <= diskCap {
 			break
 		}
 		slog.Info("disk eviction cap exceeded, deleting oldest",
 			"offset", e.node.startOffset(), "tokens", len(e.node.tokens),
 			"path", filepath.Base(e.node.diskFile))
+		c.emitEvent(EventEvictFromDisk, e.node, e.size, filepath.Base(e.node.diskFile))
 		os.Remove(e.node.diskFile)
 		e.node.diskFile = ""
 		e.node.diskFileSize = 0
 		e.node.snapTypes = nil
-		totalDiskBytes -= e.size
+		c.totalDiskBytes -= e.size
 
 		if len(e.node.children) == 0 {
 			removeNode(e.node, &c.pagedOutBytes)
@@ -486,9 +491,8 @@ func cleanStaleEvictedFiles(dir string) {
 	}
 }
 
-// cleanStaleNodeFiles removes node_*.safetensors files with indices >= nodeCount.
-// These are leftovers from a previous save that had more nodes than the current one.
-// Best-effort: logs and continues on individual removal failures.
+// cleanStaleNodeFiles removes node_*.safetensors with indices >= nodeCount,
+// left over from a previous save that had more nodes.
 func cleanStaleNodeFiles(dir string, nodeCount int) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -539,8 +543,35 @@ func streamCopyFile(src, dst string) error {
 	return out.Close()
 }
 
-// atomicWriteFile writes data to tmpPath, fsyncs it, then renames to finalPath.
-// The tmp file is cleaned up on any error.
+// atomicSaveSafetensors writes a safetensors file via tmp+rename to prevent
+// partial writes on crash. Returns the file size on success.
+func atomicSaveSafetensors(dir, filename string, arrays map[string]*mlx.Array, metadata map[string]string) (int64, error) {
+	// Use a .tmp_ prefix (not suffix) so the file retains the .safetensors
+	// extension that the MLX C library expects.
+	tmpPath := filepath.Join(dir, ".tmp_"+filename)
+	finalPath := filepath.Join(dir, filename)
+
+	if err := mlx.SaveSafetensorsWithMetadata(tmpPath, arrays, metadata); err != nil {
+		os.Remove(tmpPath)
+		return 0, err
+	}
+
+	info, err := os.Stat(tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return 0, fmt.Errorf("stat %s: %w", tmpPath, err)
+	}
+	fileSize := info.Size()
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
+		return 0, fmt.Errorf("rename %s: %w", finalPath, err)
+	}
+
+	return fileSize, nil
+}
+
+// atomicWriteFile writes data via tmp+rename to prevent partial writes on crash.
 func atomicWriteFile(tmpPath, finalPath string, data []byte) error {
 	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {

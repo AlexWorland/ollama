@@ -213,7 +213,7 @@ func (r *Runner) TextGenerationPipeline(request Request) error {
 	}
 }
 
-func (r Runner) Decode(sample int32, b *bytes.Buffer) string {
+func (r *Runner) Decode(sample int32, b *bytes.Buffer) string {
 	token := r.Tokenizer.Decode([]int32{sample})
 
 	if _, err := b.WriteString(token); err != nil {

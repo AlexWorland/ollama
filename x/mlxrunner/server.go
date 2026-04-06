@@ -61,6 +61,10 @@ func Execute(args []string) error {
 	// Restore cached KV trie from a previous session.
 	runner.restoreCache()
 
+	// Initialize visualization infrastructure and capture initial snapshot.
+	runner.cache.events = newCacheEventBus()
+	runner.cache.rebuildSnapshot()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(statusResponse{
@@ -162,6 +166,17 @@ func Execute(args []string) error {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
+	})
+
+	mux.HandleFunc("GET /v1/cache/trie", func(w http.ResponseWriter, r *http.Request) {
+		runner.cache.handleTrieSnapshot(w, r)
+	})
+	mux.HandleFunc("GET /v1/cache/events", func(w http.ResponseWriter, r *http.Request) {
+		runner.cache.handleCacheEvents(w, r)
+	})
+	mux.HandleFunc("GET /v1/cache/trie/ui", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, cacheTrieHTML)
 	})
 
 	for source, target := range map[string]string{

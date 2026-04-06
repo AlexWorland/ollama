@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -182,7 +183,9 @@ func (r *Runner) Run(ctx context.Context, host, port string, mux http.Handler) e
 
 	g.Go(func() error {
 		<-gCtx.Done()
-		return srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
 	})
 
 	return g.Wait()

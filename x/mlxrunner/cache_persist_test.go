@@ -1,6 +1,7 @@
 package mlxrunner
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -328,5 +329,300 @@ func TestSaveLoadBranchingTrie(t *testing.T) {
 	}
 	if !tokensSet[4] || !tokensSet[6] {
 		t.Fatalf("expected branches starting with 4 and 6, got %v", tokensSet)
+	}
+}
+
+func TestEvictAndReloadNodeRoundTrip(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 2
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = t.TempDir()
+
+	// Build root -> [1,2,3] leaf with snapshots.
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+
+	if c.pagedOutBytes == 0 {
+		t.Fatal("expected non-zero pagedOutBytes after snapshot")
+	}
+	bytesBeforeEvict := c.pagedOutBytes
+
+	// Evict to disk.
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal("evictNodeToDisk:", err)
+	}
+
+	// Verify eviction state.
+	if leaf.diskFile == "" {
+		t.Fatal("diskFile should be set after eviction")
+	}
+	if leaf.hasSnapshots() {
+		t.Fatal("snapshots should be nil after eviction")
+	}
+	if leaf.snapTypes == nil {
+		t.Fatal("snapTypes should be preserved after eviction")
+	}
+	if leaf.diskFileSize == 0 {
+		t.Fatal("diskFileSize should be non-zero")
+	}
+	if c.pagedOutBytes != 0 {
+		t.Fatalf("pagedOutBytes should be 0 after eviction, got %d", c.pagedOutBytes)
+	}
+	if c.totalDiskBytes != leaf.diskFileSize {
+		t.Fatalf("totalDiskBytes mismatch: got %d, want %d", c.totalDiskBytes, leaf.diskFileSize)
+	}
+
+	// Verify file exists on disk.
+	if _, err := os.Stat(leaf.diskFile); err != nil {
+		t.Fatal("evicted file should exist:", err)
+	}
+
+	// Reload from disk.
+	if err := c.loadNodeFromDisk(leaf); err != nil {
+		t.Fatal("loadNodeFromDisk:", err)
+	}
+
+	// Verify reload state.
+	if !leaf.hasSnapshots() {
+		t.Fatal("snapshots should be restored after reload")
+	}
+	if leaf.diskFile != "" {
+		t.Fatal("diskFile should be cleared after reload")
+	}
+	if leaf.diskFileSize != 0 {
+		t.Fatal("diskFileSize should be 0 after reload")
+	}
+	if c.pagedOutBytes == 0 {
+		t.Fatal("pagedOutBytes should be non-zero after reload")
+	}
+	if c.totalDiskBytes != 0 {
+		t.Fatalf("totalDiskBytes should be 0 after reload, got %d", c.totalDiskBytes)
+	}
+
+	// Verify snapshot data is usable (approximately same size as before).
+	if c.pagedOutBytes != bytesBeforeEvict {
+		t.Fatalf("pagedOutBytes mismatch: got %d, want %d", c.pagedOutBytes, bytesBeforeEvict)
+	}
+}
+
+func TestEvictNodeDiskFailureFallsBackToDelete(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 1
+	c := makeTestKVCache(t, numLayers)
+	// Empty cacheDir causes evictNodeToDisk to fail.
+	c.cacheDir = ""
+
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	c.activePath = []*trieNode{c.root}
+
+	beforeBytes := c.pagedOutBytes
+	if beforeBytes == 0 {
+		t.Fatal("expected non-zero pagedOutBytes")
+	}
+
+	// evictNode should fall back to removeNode when disk write fails.
+	c.evictNode(leaf)
+
+	// Leaf should be removed from trie.
+	if len(c.root.children) != 0 {
+		t.Fatalf("root should have 0 children after fallback delete, got %d", len(c.root.children))
+	}
+	if c.pagedOutBytes != 0 {
+		t.Fatalf("pagedOutBytes should be 0 after removal, got %d", c.pagedOutBytes)
+	}
+}
+
+func TestEnforceDiskEvictionPolicyDeletesOldest(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	dir := t.TempDir()
+	numLayers := 1
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = dir
+
+	// Create 3 leaf nodes with disk-backed files.
+	feedTokens(c, 2)
+	leafA := c.root.appendTokens(c.root, []int32{1, 2}, 2)
+	snapsA := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snapsA[j] = kv.Snapshot(0)
+	}
+	leafA.setSnapshots(snapsA, &c.pagedOutBytes)
+
+	feedTokens(c, 2)
+	leafB := c.root.appendTokens(c.root, []int32{3, 4}, 2)
+	snapsB := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snapsB[j] = kv.Snapshot(0)
+	}
+	leafB.setSnapshots(snapsB, &c.pagedOutBytes)
+
+	feedTokens(c, 2)
+	leafC := c.root.appendTokens(c.root, []int32{5, 6}, 2)
+	snapsC := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snapsC[j] = kv.Snapshot(0)
+	}
+	leafC.setSnapshots(snapsC, &c.pagedOutBytes)
+
+	// Evict all three to disk with staggered timestamps.
+	c.activePath = []*trieNode{c.root} // none active
+	if err := c.evictNodeToDisk(leafA); err != nil {
+		t.Fatal(err)
+	}
+	leafA.lastUsed = time.Now().Add(-3 * time.Hour) // oldest
+
+	if err := c.evictNodeToDisk(leafB); err != nil {
+		t.Fatal(err)
+	}
+	leafB.lastUsed = time.Now().Add(-2 * time.Hour)
+
+	if err := c.evictNodeToDisk(leafC); err != nil {
+		t.Fatal(err)
+	}
+	leafC.lastUsed = time.Now().Add(-1 * time.Hour) // newest
+
+	// Set cap to allow only the largest node (leafC) to survive.
+	t.Setenv("OLLAMA_KV_CACHE_DISK_MAX", fmt.Sprintf("%d", leafC.diskFileSize+1))
+
+	c.enforceDiskEvictionPolicy()
+
+	// leafA (oldest) and leafB should be deleted; leafC should remain.
+	if leafA.diskFile != "" {
+		t.Fatal("leafA should have been evicted from disk")
+	}
+	if leafB.diskFile != "" {
+		t.Fatal("leafB should have been evicted from disk")
+	}
+	if leafC.diskFile == "" {
+		t.Fatal("leafC should still be on disk")
+	}
+	if c.totalDiskBytes != leafC.diskFileSize {
+		t.Fatalf("totalDiskBytes mismatch: got %d, want %d", c.totalDiskBytes, leafC.diskFileSize)
+	}
+}
+
+func TestSaveTrieWithColdNodes(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	dir := t.TempDir()
+	modelID := "sha256:cold-test"
+	numLayers := 1
+
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = dir
+
+	// Build root -> [1,2,3] with snapshots, then evict to disk.
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	c.activePath = []*trieNode{c.root}
+
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the evicted file exists.
+	evictedPath := leaf.diskFile
+	if _, err := os.Stat(evictedPath); err != nil {
+		t.Fatal("evicted file should exist:", err)
+	}
+
+	// Save trie — should rename evicted file to node_N.safetensors.
+	if err := c.saveTrie(dir, modelID); err != nil {
+		t.Fatal("saveTrie:", err)
+	}
+
+	// Evicted file should be gone (renamed).
+	if _, err := os.Stat(evictedPath); !os.IsNotExist(err) {
+		t.Fatal("evicted file should have been renamed")
+	}
+
+	// Load and verify the cold node round-trips.
+	root, _, err := loadTrie(dir, modelID, numLayers)
+	if err != nil {
+		t.Fatal("loadTrie:", err)
+	}
+	if root == nil {
+		t.Fatal("nil root")
+	}
+	if len(root.children) != 1 {
+		t.Fatalf("expected 1 child, got %d", len(root.children))
+	}
+
+	restored := root.children[0]
+	if len(restored.tokens) != 3 || restored.tokens[0] != 1 {
+		t.Fatalf("token mismatch: %v", restored.tokens)
+	}
+	if !restored.hasAllSnapshots() {
+		t.Fatal("cold node should have snapshots after load")
+	}
+}
+
+func TestCleanStaleFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create test files.
+	for _, name := range []string{
+		"evicted_0.safetensors", "evicted_1.safetensors",
+		"node_0.safetensors", "node_1.safetensors", "node_2.safetensors",
+		"node_3.safetensors", "node_4.safetensors",
+		"trie.json",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Clean evicted files.
+	cleanStaleEvictedFiles(dir)
+	for _, name := range []string{"evicted_0.safetensors", "evicted_1.safetensors"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s should have been removed", name)
+		}
+	}
+	// Node files should be untouched.
+	for i := 0; i <= 4; i++ {
+		name := nodeFileName(i)
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s should still exist", name)
+		}
+	}
+
+	// Clean stale node files (keep 0-2, remove 3-4).
+	cleanStaleNodeFiles(dir, 3)
+	for i := 0; i <= 2; i++ {
+		name := nodeFileName(i)
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s should still exist", name)
+		}
+	}
+	for i := 3; i <= 4; i++ {
+		name := nodeFileName(i)
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s should have been removed", name)
+		}
+	}
+
+	// trie.json should be untouched.
+	if _, err := os.Stat(filepath.Join(dir, "trie.json")); err != nil {
+		t.Fatal("trie.json should still exist")
 	}
 }

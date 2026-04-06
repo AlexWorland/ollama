@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/ollama/ollama/logutil"
@@ -32,6 +33,9 @@ import (
 
 const maxPagedOutBytes int64 = 8 << 30 // 8 GiB eviction threshold for paged-out snapshot memory
 
+// kvCache manages the trie-based KV attention cache. All methods are called
+// from the single request-processing goroutine in Runner.Run (via the
+// Requests channel). No concurrent access protection is needed.
 type kvCache struct {
 	root          *trieNode   // root of the prefix trie
 	activePath    []*trieNode // current root→leaf path with live MLX arrays
@@ -39,9 +43,14 @@ type kvCache struct {
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
 
 	// Disk-backed eviction state.
-	cacheDir   string // directory for persisted/evicted safetensors files
-	modelID    string // for validation on reload
-	nextDiskID int    // monotonic counter for unique eviction filenames
+	cacheDir       string // directory for persisted/evicted safetensors files
+	modelID        string // for validation on reload
+	nextDiskID     int    // monotonic counter for unique eviction filenames
+	totalDiskBytes int64  // running total of disk-backed node file sizes
+
+	// Visualization (safe for cross-goroutine reads via atomic/bus).
+	events       *cacheEventBus
+	trieSnapshot atomic.Pointer[TrieSnapshot]
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.
@@ -176,6 +185,7 @@ func (c *kvCache) switchToPath(newPath []*trieNode, matched int) {
 				snaps[j] = kv.Snapshot(fromOffset)
 			}
 			node.setSnapshots(snaps, &c.pagedOutBytes)
+			c.emitEvent(EventPageOut, node, node.snapshotBytes(), "")
 			pageOutCount++
 			logutil.Trace(fmt.Sprintf("page out: [%d, %d)", fromOffset, node.endOffset))
 		}
@@ -203,14 +213,16 @@ pageIn:
 	for _, node := range newPath {
 		// Load from disk if this node was evicted.
 		if !node.hasSnapshots() && node.diskFile != "" {
+			diskBase := filepath.Base(node.diskFile) // capture before loadNodeFromDisk clears it
 			slog.Debug("switchToPath: loading evicted node from disk",
 				"offset", node.startOffset(), "tokens", len(node.tokens),
-				"diskFile", filepath.Base(node.diskFile))
+				"diskFile", diskBase)
 			if err := c.loadNodeFromDisk(node); err != nil {
 				slog.Warn("failed to load node from disk", "error", err,
 					"path", node.diskFile)
 				break pageIn
 			}
+			c.emitEvent(EventPageInDisk, node, node.snapshotBytes(), diskBase)
 			pageInFromDisk++
 		}
 		if !node.hasSnapshots() {
@@ -234,6 +246,7 @@ pageIn:
 			}
 		}
 		if node.endOffset > ancestorOffset {
+			c.emitEvent(EventPageIn, node, node.snapshotBytes(), "")
 			pageInCount++
 			logutil.Trace(fmt.Sprintf("page in: [%d, %d)", node.startOffset(), nodeTarget))
 		}
@@ -265,8 +278,12 @@ pageIn:
 		c.activePath[len(c.activePath)-1].lastUsed = time.Now()
 	}
 
-	if pageOutCount > 0 || pageInCount > 0 || pageInFromDisk > 0 {
+	// Disk page-in is noteworthy (recovered context from SSD) — log at Info.
+	// In-memory page-in/out is routine per-request work — log at Debug.
+	if pageInFromDisk > 0 {
 		slog.Info("switching cache path", "page_out", pageOutCount, "page_in", pageInCount, "page_in_disk", pageInFromDisk)
+	} else if pageOutCount > 0 || pageInCount > 0 {
+		slog.Debug("switching cache path", "page_out", pageOutCount, "page_in", pageInCount)
 	}
 }
 
@@ -416,6 +433,7 @@ func (s *cacheSession) attachSnapshots(node *trieNode, cacheOffset int) {
 		}
 	}
 	node.setSnapshots(snaps, &c.pagedOutBytes)
+	c.emitEvent(EventSnapshot, node, node.snapshotBytes(), "")
 	node.lastUsed = time.Now()
 	slog.Debug("created snapshot", "offset", cacheOffset)
 	c.enforceEvictionPolicy()
@@ -476,6 +494,8 @@ func (s *cacheSession) close() {
 		}
 		c.activePath[len(c.activePath)-1].lastUsed = time.Now()
 	}
+
+	s.cache.rebuildSnapshot()
 }
 
 // enforceEvictionPolicy evicts eligible nodes until paged-out memory is within limits.
