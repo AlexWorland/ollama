@@ -89,8 +89,24 @@ func TestSaveLoadTrieRoundTrip(t *testing.T) {
 		t.Fatal("trie.json not found:", err)
 	}
 
+	// Verify files are hash-named (no node_N or evicted_N patterns).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == "trie.json" {
+			continue
+		}
+		// Hash files are 16 hex chars + .safetensors
+		if len(name) != len("0123456789abcdef.safetensors") {
+			t.Fatalf("unexpected file naming: %s", name)
+		}
+	}
+
 	// Load into a fresh trie.
-	root, pagedOut, err := loadTrie(dir, modelID, numLayers)
+	root, pagedOut, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
@@ -159,7 +175,7 @@ func TestLoadTrieModelMismatch(t *testing.T) {
 	}
 
 	// Loading with a different model ID should return nil root.
-	root, _, err := loadTrie(dir, "sha256:model_b", numLayers)
+	root, _, _, err := loadTrie(dir, "sha256:model_b", numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +205,7 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 	}
 
 	// Loading with different layer count should return nil root.
-	root, _, err := loadTrie(dir, modelID, 4)
+	root, _, _, err := loadTrie(dir, modelID, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +216,7 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 
 func TestLoadTrieNoFile(t *testing.T) {
 	dir := t.TempDir()
-	root, pagedOut, err := loadTrie(dir, "sha256:test", 2)
+	root, pagedOut, _, err := loadTrie(dir, "sha256:test", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +319,7 @@ func TestSaveLoadBranchingTrie(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, _, err := loadTrie(dir, modelID, numLayers)
+	root, _, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,9 +374,14 @@ func TestEvictAndReloadNodeRoundTrip(t *testing.T) {
 		t.Fatal("evictNodeToDisk:", err)
 	}
 
-	// Verify eviction state.
+	// Verify eviction state — file should be hash-named.
 	if leaf.diskFile == "" {
 		t.Fatal("diskFile should be set after eviction")
+	}
+	evictedName := filepath.Base(leaf.diskFile)
+	expectedHash := nodeFileHash(leaf)
+	if evictedName != expectedHash {
+		t.Fatalf("evicted file should be hash-named: got %s, want %s", evictedName, expectedHash)
 	}
 	if leaf.hasSnapshots() {
 		t.Fatal("snapshots should be nil after eviction")
@@ -539,24 +560,24 @@ func TestSaveTrieWithColdNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify the evicted file exists.
+	// Verify the evicted file exists with a hash name.
 	evictedPath := leaf.diskFile
 	if _, err := os.Stat(evictedPath); err != nil {
 		t.Fatal("evicted file should exist:", err)
 	}
 
-	// Save trie — should rename evicted file to node_N.safetensors.
+	// Save trie — cold node file is already hash-named, no rename needed.
 	if err := c.saveTrie(dir, modelID); err != nil {
 		t.Fatal("saveTrie:", err)
 	}
 
-	// Evicted file should be gone (renamed).
-	if _, err := os.Stat(evictedPath); !os.IsNotExist(err) {
-		t.Fatal("evicted file should have been renamed")
+	// Evicted file should still exist (same hash name, not renamed).
+	if _, err := os.Stat(evictedPath); err != nil {
+		t.Fatal("evicted file should still exist (same hash name):", err)
 	}
 
 	// Load and verify the cold node round-trips.
-	root, _, err := loadTrie(dir, modelID, numLayers)
+	root, _, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
@@ -576,53 +597,226 @@ func TestSaveTrieWithColdNodes(t *testing.T) {
 	}
 }
 
-func TestCleanStaleFiles(t *testing.T) {
+func TestCleanUnreferencedFiles(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create test files.
-	for _, name := range []string{
-		"evicted_0.safetensors", "evicted_1.safetensors",
-		"node_0.safetensors", "node_1.safetensors", "node_2.safetensors",
-		"node_3.safetensors", "node_4.safetensors",
-		"trie.json",
-	} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("test"), 0o600); err != nil {
+	// Create a mix of referenced and unreferenced files.
+	referenced := map[string]bool{
+		"abc123def456789a.safetensors": true,
+		"fedcba9876543210.safetensors": true,
+	}
+	orphaned := []string{
+		"0000000000000000.safetensors",
+		"1111111111111111.safetensors",
+	}
+	for name := range referenced {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("keep"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	// Clean evicted files.
-	cleanStaleEvictedFiles(dir)
-	for _, name := range []string{"evicted_0.safetensors", "evicted_1.safetensors"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Fatalf("%s should have been removed", name)
+	for _, name := range orphaned {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
-	// Node files should be untouched.
-	for i := 0; i <= 4; i++ {
-		name := nodeFileName(i)
+	// Non-safetensors files should be untouched.
+	if err := os.WriteFile(filepath.Join(dir, "trie.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanUnreferencedFiles(dir, referenced)
+
+	// Referenced files should still exist.
+	for name := range referenced {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
-			t.Fatalf("%s should still exist", name)
+			t.Fatalf("referenced file %s should still exist", name)
 		}
 	}
-
-	// Clean stale node files (keep 0-2, remove 3-4).
-	cleanStaleNodeFiles(dir, 3)
-	for i := 0; i <= 2; i++ {
-		name := nodeFileName(i)
-		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
-			t.Fatalf("%s should still exist", name)
-		}
-	}
-	for i := 3; i <= 4; i++ {
-		name := nodeFileName(i)
+	// Orphaned files should be removed.
+	for _, name := range orphaned {
 		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Fatalf("%s should have been removed", name)
+			t.Fatalf("orphaned file %s should have been removed", name)
 		}
 	}
-
 	// trie.json should be untouched.
 	if _, err := os.Stat(filepath.Join(dir, "trie.json")); err != nil {
 		t.Fatal("trie.json should still exist")
+	}
+}
+
+func TestNodeFileHashDeterministic(t *testing.T) {
+	root := &trieNode{}
+	child := &trieNode{tokens: []int32{10, 20, 30}, parent: root, endOffset: 3}
+
+	h1 := nodeFileHash(child)
+	h2 := nodeFileHash(child)
+	if h1 != h2 {
+		t.Fatalf("hash should be deterministic: got %s and %s", h1, h2)
+	}
+
+	// A structurally identical node should produce the same hash.
+	child2 := &trieNode{tokens: []int32{10, 20, 30}, parent: root, endOffset: 3}
+	h3 := nodeFileHash(child2)
+	if h1 != h3 {
+		t.Fatalf("identical token paths should hash equally: got %s and %s", h1, h3)
+	}
+}
+
+func TestNodeFileHashUnique(t *testing.T) {
+	root := &trieNode{}
+
+	// Sibling branches with different tokens.
+	branchA := &trieNode{tokens: []int32{1, 2, 3}, parent: root, endOffset: 3}
+	branchB := &trieNode{tokens: []int32{4, 5, 6}, parent: root, endOffset: 3}
+
+	hA := nodeFileHash(branchA)
+	hB := nodeFileHash(branchB)
+	if hA == hB {
+		t.Fatalf("different token paths should produce different hashes: both %s", hA)
+	}
+
+	// Same tokens but different depth (different cumulative path).
+	mid := &trieNode{tokens: []int32{1, 2}, parent: root, endOffset: 2}
+	deep := &trieNode{tokens: []int32{3}, parent: mid, endOffset: 3}
+	shallow := &trieNode{tokens: []int32{1, 2, 3}, parent: root, endOffset: 3}
+
+	hDeep := nodeFileHash(deep)
+	hShallow := nodeFileHash(shallow)
+	// Same cumulative path [1,2,3] → should be equal regardless of trie structure.
+	if hDeep != hShallow {
+		t.Fatalf("same cumulative path should hash equally: deep=%s, shallow=%s", hDeep, hShallow)
+	}
+}
+
+func TestNodeFileHashStableAfterSplit(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	numLayers := 1
+	c := makeTestKVCache(t, numLayers)
+
+	// Build root -> [1,2,3,4] with snapshots.
+	feedTokens(c, 4)
+	child := c.root.appendTokens(c.root, []int32{1, 2, 3, 4}, 4)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	child.setSnapshots(snaps, &c.pagedOutBytes)
+
+	// Hash of the full [1,2,3,4] node before split.
+	hashBefore := nodeFileHash(child)
+
+	// Split at position 2: [1,2,3,4] → [1,2] → [3,4]
+	// splitNode returns the new prefix parent; the original child variable
+	// is modified in-place to become the tail with tokens [3,4].
+	_ = splitNode(child, 2, c.caches, &c.pagedOutBytes)
+
+	// child is now the tail [3,4] with parent [1,2] — cumulative path
+	// is still [1,2,3,4], so hash should be unchanged.
+	hashAfter := nodeFileHash(child)
+	if hashBefore != hashAfter {
+		t.Fatalf("split tail should retain cumulative path hash: before=%s, after=%s", hashBefore, hashAfter)
+	}
+}
+
+func TestIncrementalSaveSkipsColdNodes(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	dir := t.TempDir()
+	modelID := "sha256:incremental"
+	numLayers := 1
+
+	c := makeTestKVCache(t, numLayers)
+	c.cacheDir = dir
+
+	// Build root -> [1,2,3] with snapshots, evict to disk.
+	feedTokens(c, 3)
+	leaf := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	leaf.setSnapshots(snaps, &c.pagedOutBytes)
+	c.activePath = []*trieNode{c.root}
+
+	if err := c.evictNodeToDisk(leaf); err != nil {
+		t.Fatal(err)
+	}
+
+	coldFile := leaf.diskFile
+	info1, err := os.Stat(coldFile)
+	if err != nil {
+		t.Fatal("cold file should exist:", err)
+	}
+
+	// Save trie — cold node should NOT be rewritten.
+	if err := c.saveTrie(dir, modelID); err != nil {
+		t.Fatal(err)
+	}
+
+	info2, err := os.Stat(coldFile)
+	if err != nil {
+		t.Fatal("cold file should still exist after save:", err)
+	}
+
+	// ModTime should be unchanged (file was not rewritten).
+	if !info1.ModTime().Equal(info2.ModTime()) {
+		t.Fatal("cold node file should not have been rewritten during save")
+	}
+}
+
+func TestCrashSafetyPartialSave(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	dir := t.TempDir()
+	modelID := "sha256:crash-test"
+	numLayers := 1
+
+	// First: create a valid save.
+	c := makeTestKVCache(t, numLayers)
+	feedTokens(c, 3)
+	child := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snaps := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snaps[j] = kv.Snapshot(0)
+	}
+	child.setSnapshots(snaps, &c.pagedOutBytes)
+	c.activePath = []*trieNode{c.root, child}
+
+	if err := c.saveTrie(dir, modelID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a "crash" by writing an orphaned hash file (as if a new
+	// save started writing node files but crashed before writing trie.json).
+	orphanName := "deadbeefdeadbeef.safetensors"
+	if err := os.WriteFile(filepath.Join(dir, orphanName), []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load should succeed (old trie.json + old hash files are consistent).
+	root, pagedOut, referenced, err := loadTrie(dir, modelID, numLayers)
+	if err != nil {
+		t.Fatal("loadTrie:", err)
+	}
+	if root == nil {
+		t.Fatal("nil root — crash should not corrupt existing save")
+	}
+	if pagedOut == 0 {
+		t.Fatal("expected non-zero paged out bytes")
+	}
+
+	// Cleanup should remove the orphan.
+	cleanUnreferencedFiles(dir, referenced)
+	if _, err := os.Stat(filepath.Join(dir, orphanName)); !os.IsNotExist(err) {
+		t.Fatal("orphaned file should have been cleaned up")
+	}
+
+	// Original data should still be loadable.
+	if len(root.children) != 1 {
+		t.Fatalf("expected 1 child, got %d", len(root.children))
+	}
+	if !root.children[0].hasAllSnapshots() {
+		t.Fatal("child should have snapshots")
 	}
 }

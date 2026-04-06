@@ -252,16 +252,18 @@ func (r *Runner) restoreCache() {
 	r.cache.cacheDir = dir
 	r.cache.modelID = r.modelDigest
 
-	root, pagedOut, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
+	root, pagedOut, referenced, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
 	if err != nil {
 		slog.Warn("failed to load cached KV trie", "error", err)
 		return
 	}
 
-	// Remove orphaned evicted_*.safetensors left over from a crash
-	// during a previous session's mid-run eviction. These aren't
-	// referenced by trie.json (which uses node_* names at save time).
-	cleanStaleEvictedFiles(dir)
+	// Remove orphaned .safetensors files not referenced by trie.json
+	// (left over from a crash during a previous session's save or eviction).
+	if referenced == nil {
+		referenced = make(map[string]bool)
+	}
+	cleanUnreferencedFiles(dir, referenced)
 
 	if root == nil {
 		return

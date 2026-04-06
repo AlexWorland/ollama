@@ -45,7 +45,6 @@ type kvCache struct {
 	// Disk-backed eviction state.
 	cacheDir       string // directory for persisted/evicted safetensors files
 	modelID        string // for validation on reload
-	nextDiskID     int    // monotonic counter for unique eviction filenames
 	totalDiskBytes int64  // running total of disk-backed node file sizes
 
 	// Visualization (safe for cross-goroutine reads via atomic/bus).

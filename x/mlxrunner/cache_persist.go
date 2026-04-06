@@ -1,14 +1,14 @@
 package mlxrunner
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,16 +17,31 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
-const trieFormatVersion = 1
+const trieFormatVersion = 2
 
-const (
-	nodeFilePrefix    = "node_"
-	evictedFilePrefix = "evicted_"
-	nodeFileSuffix    = ".safetensors"
-)
+// nodeFileHash returns a content-addressable filename for a trie node based
+// on its cumulative token path from root. Two nodes with the same path
+// always produce the same hash; different paths never collide in practice.
+func nodeFileHash(node *trieNode) string {
+	// Walk parent chain to collect full token path root→node.
+	var segments [][]int32
+	total := 0
+	for n := node; n != nil && len(n.tokens) > 0; n = n.parent {
+		segments = append(segments, n.tokens)
+		total += len(n.tokens)
+	}
 
-func nodeFileName(i int) string {
-	return fmt.Sprintf("%s%d%s", nodeFilePrefix, i, nodeFileSuffix)
+	buf := make([]byte, total*4)
+	off := len(buf) // fill from end (segments are child→root order)
+	for _, seg := range segments {
+		off -= len(seg) * 4
+		for i, tok := range seg {
+			binary.LittleEndian.PutUint32(buf[off+i*4:], uint32(tok))
+		}
+	}
+
+	sum := sha256.Sum256(buf)
+	return fmt.Sprintf("%x.safetensors", sum[:8])
 }
 
 // layerKey builds a safetensors key for a specific layer's field (e.g. "layer_3_keys").
@@ -41,6 +56,7 @@ type persistedNode struct {
 	User      bool                 `json:"user,omitempty"`
 	Children  []int                `json:"children,omitempty"`
 	SnapTypes []cache.SnapshotType `json:"snap_types,omitempty"` // per-layer: "kv","rotating","recurrent",""
+	File      string               `json:"file,omitempty"`       // content-addressed filename
 }
 
 // persistedTrie is the JSON-serializable form of the full trie.
@@ -84,6 +100,9 @@ func (c *kvCache) captureActiveFrontier() {
 }
 
 // saveTrie serializes the trie topology and all snapshot data to cacheDir.
+// Files are named by a SHA-256 hash of each node's cumulative token path,
+// making writes idempotent and crash-safe: writing <hashA>.safetensors can
+// never overwrite <hashB>.safetensors (different paths = different hashes).
 func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 	if c.root == nil {
 		return nil
@@ -91,7 +110,7 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 
 	c.captureActiveFrontier()
 
-	// Assign sequential IDs via depth-first walk.
+	// Assign sequential IDs via depth-first walk (still needed for Children references).
 	nodeMap := make(map[*trieNode]int)
 	var nodes []*trieNode
 	walkNodes(c.root, func(n *trieNode) bool {
@@ -111,10 +130,9 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		SavedAt:   time.Now().UTC().Format(time.RFC3339),
 	}
 
-	// Write new node files first (overwriting any with matching indices).
-	// This avoids a crash-vulnerability window where old files are deleted
-	// but new ones haven't been written yet.
-	for i, node := range nodes {
+	referenced := make(map[string]bool)
+
+	for _, node := range nodes {
 		pn := persistedNode{
 			Tokens:    node.tokens,
 			EndOffset: node.endOffset,
@@ -130,31 +148,25 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 			pn.SnapTypes = types
 
 			if len(arrays) > 0 {
-				if _, err := atomicSaveSafetensors(cacheDir, nodeFileName(i), arrays, metadata); err != nil {
-					return fmt.Errorf("save node %d: %w", i, err)
+				hash := nodeFileHash(node)
+				if _, err := atomicSaveSafetensors(cacheDir, hash, arrays, metadata); err != nil {
+					return fmt.Errorf("save node %d: %w", nodeMap[node], err)
 				}
+				pn.File = hash
+				referenced[hash] = true
 			}
 		} else if node.diskFile != "" {
-			// Cold node: snapshot data lives on disk from a mid-session
-			// eviction. Rename the evicted file to the sequential name
-			// so loadTrie finds it on next startup.
-			destPath := filepath.Join(cacheDir, nodeFileName(i))
-			if err := os.Rename(node.diskFile, destPath); err != nil {
-				// Cross-device or other failure: stream-copy as fallback.
-				slog.Warn("rename failed, copying evicted file", "src", node.diskFile, "dest", destPath, "error", err)
-				if copyErr := streamCopyFile(node.diskFile, destPath); copyErr != nil {
-					return fmt.Errorf("copy evicted node %d: %w", i, copyErr)
-				}
-				os.Remove(node.diskFile)
-			}
+			// Cold node: already on disk with a content-addressed name
+			// from evictNodeToDisk. No rename or copy needed.
+			name := filepath.Base(node.diskFile)
+			pn.File = name
 			pn.SnapTypes = node.snapTypes
+			referenced[name] = true
 		}
 
 		persisted.Nodes = append(persisted.Nodes, pn)
 	}
 
-	// Write trie.json atomically, then clean up stale node files from a
-	// previous save that had more nodes than the current one.
 	data, err := json.Marshal(persisted)
 	if err != nil {
 		return fmt.Errorf("marshal trie: %w", err)
@@ -166,44 +178,45 @@ func (c *kvCache) saveTrie(cacheDir, modelID string) error {
 		return err
 	}
 
-	cleanStaleNodeFiles(cacheDir, len(nodes))
+	cleanUnreferencedFiles(cacheDir, referenced)
 
 	slog.Info("KV cache saved", "nodes", len(nodes), "dir", cacheDir)
 	return nil
 }
 
-// loadTrie deserializes the trie from cacheDir. Returns (nil, 0, nil) if
-// no cache exists or the version/model doesn't match.
-func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error) {
+// loadTrie deserializes the trie from cacheDir. Returns the root node, total
+// paged-out bytes, and the set of referenced filenames (for cleanup). Returns
+// (nil, 0, nil, nil) if no cache exists or the version/model doesn't match.
+func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, map[string]bool, error) {
 	triePath := filepath.Join(cacheDir, "trie.json")
 	data, err := os.ReadFile(triePath)
 	if os.IsNotExist(err) {
-		return nil, 0, nil
+		return nil, 0, nil, nil
 	}
 	if err != nil {
-		return nil, 0, fmt.Errorf("read trie.json: %w", err)
+		return nil, 0, nil, fmt.Errorf("read trie.json: %w", err)
 	}
 
 	var persisted persistedTrie
 	if err := json.Unmarshal(data, &persisted); err != nil {
-		return nil, 0, fmt.Errorf("parse trie.json: %w", err)
+		return nil, 0, nil, fmt.Errorf("parse trie.json: %w", err)
 	}
 
 	if persisted.Version != trieFormatVersion {
 		slog.Info("ignoring cached trie: version mismatch", "file", persisted.Version, "expected", trieFormatVersion)
-		return nil, 0, nil
+		return nil, 0, nil, nil
 	}
 	if persisted.ModelID != modelID {
 		slog.Info("ignoring cached trie: model mismatch", "cached", persisted.ModelID, "current", modelID)
-		return nil, 0, nil
+		return nil, 0, nil, nil
 	}
 	if persisted.NumLayers != numLayers {
 		slog.Info("ignoring cached trie: layer count mismatch", "cached", persisted.NumLayers, "current", numLayers)
-		return nil, 0, nil
+		return nil, 0, nil, nil
 	}
 
 	if len(persisted.Nodes) == 0 {
-		return nil, 0, nil
+		return nil, 0, nil, nil
 	}
 
 	trieNodes := make([]*trieNode, len(persisted.Nodes))
@@ -219,7 +232,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 	for i, pn := range persisted.Nodes {
 		for _, childID := range pn.Children {
 			if childID < 0 || childID >= len(trieNodes) {
-				return nil, 0, fmt.Errorf("node %d references invalid child %d", i, childID)
+				return nil, 0, nil, fmt.Errorf("node %d references invalid child %d", i, childID)
 			}
 			child := trieNodes[childID]
 			child.parent = trieNodes[i]
@@ -227,13 +240,24 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 		}
 	}
 
+	referenced := make(map[string]bool)
 	var pagedOutBytes int64
 	for i, pn := range persisted.Nodes {
-		if len(pn.SnapTypes) == 0 {
+		if pn.File == "" || len(pn.SnapTypes) == 0 {
 			continue
 		}
 
-		nodePath := filepath.Join(cacheDir, nodeFileName(i))
+		// Validate hash matches the reconstructed node's token path.
+		expectedHash := nodeFileHash(trieNodes[i])
+		if pn.File != expectedHash {
+			slog.Warn("node file hash mismatch, skipping", "node", i,
+				"stored", pn.File, "expected", expectedHash)
+			continue
+		}
+
+		referenced[pn.File] = true
+
+		nodePath := filepath.Join(cacheDir, pn.File)
 		sf, err := mlx.LoadSafetensorsNative(nodePath)
 		if err != nil {
 			slog.Warn("failed to load node snapshot, skipping", "node", i, "error", err)
@@ -280,7 +304,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, error)
 	}
 
 	root := trieNodes[0]
-	return root, pagedOutBytes, nil
+	return root, pagedOutBytes, referenced, nil
 }
 
 // closeSnapshots closes all non-nil snapshots in the slice.
@@ -340,7 +364,8 @@ func exportNodeSnapshots(snapshots []cache.Snapshot) (map[string]*mlx.Array, map
 
 // evictNodeToDisk serializes a node's snapshots to a safetensors file on disk,
 // then nils the in-memory snapshots. The node remains in the trie with diskFile
-// set so it can be reloaded on demand.
+// set so it can be reloaded on demand. The file is named by a content-addressable
+// hash so saveTrie can reference it without renaming.
 func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	if c.cacheDir == "" {
 		return fmt.Errorf("cacheDir not set")
@@ -351,7 +376,7 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 		return fmt.Errorf("no arrays to evict")
 	}
 
-	filename := fmt.Sprintf("%s%d%s", evictedFilePrefix, c.nextDiskID, nodeFileSuffix)
+	filename := nodeFileHash(node)
 	fileSize, err := atomicSaveSafetensors(c.cacheDir, filename, arrays, metadata)
 	if err != nil {
 		return fmt.Errorf("save evicted node: %w", err)
@@ -364,7 +389,6 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	node.diskFile = filepath.Join(c.cacheDir, filename)
 	node.diskFileSize = fileSize
 	node.setSnapshots(nil, &c.pagedOutBytes)
-	c.nextDiskID++
 	c.totalDiskBytes += fileSize
 
 	c.emitEvent(EventEvictToDisk, node, fileSize, filename)
@@ -474,73 +498,19 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 	}
 }
 
-// cleanStaleEvictedFiles removes orphaned evicted_*.safetensors files that
-// aren't referenced by any node in the trie. Called after loadTrie.
-func cleanStaleEvictedFiles(dir string) {
+// cleanUnreferencedFiles removes any .safetensors files in dir not in the
+// referenced set. Called after writing trie.json and on startup after loadTrie.
+func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, evictedFilePrefix) && strings.HasSuffix(name, nodeFileSuffix) {
-			if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
-				slog.Warn("failed to remove stale evicted file", "file", name, "error", err)
-			}
+		if strings.HasSuffix(name, ".safetensors") && !referenced[name] {
+			os.Remove(filepath.Join(dir, name))
 		}
 	}
-}
-
-// cleanStaleNodeFiles removes node_*.safetensors with indices >= nodeCount,
-// left over from a previous save that had more nodes.
-func cleanStaleNodeFiles(dir string, nodeCount int) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, nodeFilePrefix) || !strings.HasSuffix(name, nodeFileSuffix) {
-			continue
-		}
-		idxStr := strings.TrimPrefix(strings.TrimSuffix(name, nodeFileSuffix), nodeFilePrefix)
-		idx, err := strconv.Atoi(idxStr)
-		if err != nil {
-			continue
-		}
-		if idx >= nodeCount {
-			if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
-				slog.Warn("failed to remove stale cache file", "file", name, "error", err)
-			}
-		}
-	}
-}
-
-// streamCopyFile copies src to dst using streaming I/O to avoid loading the
-// entire file into memory (important for large safetensors files).
-func streamCopyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", src, err)
-	}
-	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
-	}
-
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(dst)
-		return fmt.Errorf("copy to %s: %w", dst, err)
-	}
-	if err := out.Sync(); err != nil {
-		out.Close()
-		os.Remove(dst)
-		return fmt.Errorf("fsync %s: %w", dst, err)
-	}
-	return out.Close()
 }
 
 // atomicSaveSafetensors writes a safetensors file via tmp+rename to prevent
