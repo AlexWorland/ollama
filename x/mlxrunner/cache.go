@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -550,6 +551,8 @@ func (c *kvCache) enforceEvictionPolicy() {
 		}
 		c.evictNode(node)
 	}
+
+	c.enforceDiskEvictionPolicy()
 }
 
 // evictNode evicts a single node from the trie, freeing its snapshot memory.
@@ -577,98 +580,10 @@ func (c *kvCache) evictNode(node *trieNode) {
 }
 
 func (c *kvCache) dumpTree() {
-	// Summary stats
-	var cacheBytes int
-	for _, kv := range c.caches {
-		if kv == nil {
-			continue
-		}
-		for _, a := range kv.State() {
-			if a != nil {
-				cacheBytes += a.NumBytes()
-			}
-		}
-	}
-
-	active := c.activeSet()
-
-	var nodeCount, snapshotCount int
-	var pagedBytes int64
-	var lines []string
-	var dump func(n *trieNode, prefix string, isLast bool)
-	dump = func(n *trieNode, prefix string, isLast bool) {
-		if n == nil {
-			return
-		}
-		nodeCount++
-
-		// Build connector
-		var connector string
-		if n.parent == nil {
-			connector = ""
-		} else if isLast {
-			connector = prefix + "`-- "
-		} else {
-			connector = prefix + "|-- "
-		}
-
-		// Node label
-		nodeBytes := n.snapshotBytes()
-		pagedBytes += nodeBytes
-
-		label := fmt.Sprintf("[%d,%d) %dt", n.startOffset(), n.endOffset, len(n.tokens))
-		if nodeBytes > 0 {
-			label += " " + mlx.PrettyBytes(int(nodeBytes)).String()
-		}
-		if !n.lastUsed.IsZero() {
-			label += fmt.Sprintf(" %s ago", time.Since(n.lastUsed).Truncate(time.Millisecond))
-		}
-		var flags []string
-		if n.user {
-			flags = append(flags, "user")
-		}
-		if n.hasAllSnapshots() {
-			snapshotCount++
-			flags = append(flags, "snap")
-		}
-		if active[n] {
-			flags = append(flags, "active")
-		}
-		if n.diskFile != "" {
-			flags = append(flags, "disk")
-		}
-		if len(flags) > 0 {
-			label += " (" + flags[0]
-			for _, f := range flags[1:] {
-				label += ", " + f
-			}
-			label += ")"
-		}
-		lines = append(lines, connector+label)
-
-		// Recurse children
-		childPrefix := prefix
-		if n.parent != nil {
-			if isLast {
-				childPrefix += "    "
-			} else {
-				childPrefix += "|   "
-			}
-		}
-		for i, child := range n.children {
-			dump(child, childPrefix, i == len(n.children)-1)
-		}
-	}
-	dump(c.root, "", true)
-
-	offset := c.minCacheOffset()
-	logutil.Trace(fmt.Sprintf("kv cache active_tokens: %d, active_size: %s, paged_out: %s, trie: nodes=%d, snapshots=%d",
-		offset, mlx.PrettyBytes(cacheBytes), mlx.PrettyBytes(int(pagedBytes)), nodeCount, snapshotCount))
-	for i, l := range lines {
-		if i == 0 {
-			logutil.Trace("cache trie: " + l)
-		} else {
-			logutil.Trace("  " + l)
+	snap := c.buildTrieSnapshot()
+	for _, line := range strings.Split(renderTrieText(snap), "\n") {
+		if line != "" {
+			logutil.Trace(line)
 		}
 	}
 }

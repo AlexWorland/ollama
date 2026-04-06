@@ -47,11 +47,7 @@ func (n *trieNode) snapshotBytes() int64 {
 // If counter is non-nil, the net byte delta is applied to it.
 func (n *trieNode) setSnapshots(snaps []cache.Snapshot, counter *int64) {
 	old := n.swapSnapshots(snaps, counter)
-	for _, s := range old {
-		if s != nil {
-			s.Close()
-		}
-	}
+	closeSnapshots(old)
 }
 
 // swapSnapshots is like setSnapshots but returns the previous snapshots

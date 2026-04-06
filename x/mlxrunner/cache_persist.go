@@ -44,7 +44,6 @@ func nodeFileHash(node *trieNode) string {
 	return fmt.Sprintf("%x.safetensors", sum[:8])
 }
 
-// layerKey builds a safetensors key for a specific layer's field (e.g. "layer_3_keys").
 func layerKey(layer int, field string) string {
 	return fmt.Sprintf("layer_%d_%s", layer, field)
 }
@@ -97,9 +96,6 @@ func (c *kvCache) captureActiveFrontier() {
 	frontier.setSnapshots(snaps, &c.pagedOutBytes)
 }
 
-// Files are named by a SHA-256 hash of each node's cumulative token path,
-// making writes idempotent and crash-safe: writing <hashA>.safetensors can
-// never overwrite <hashB>.safetensors (different paths = different hashes).
 func (c *kvCache) saveTrie() error {
 	cacheDir := c.cacheDir
 	modelID := c.modelID
@@ -141,7 +137,7 @@ func (c *kvCache) saveTrie() error {
 
 			if len(arrays) > 0 {
 				hash := nodeFileHash(node)
-				path := filepath.Join(cacheDir, hash+".safetensors")
+				path := filepath.Join(cacheDir, hash)
 				if _, err := os.Stat(path); err != nil {
 					// Content-addressed file doesn't exist yet — write it.
 					if _, err := atomicSaveSafetensors(cacheDir, hash, arrays, metadata); err != nil {
@@ -386,7 +382,6 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	c.totalDiskBytes += fileSize
 
 	c.emitEvent(EventEvictToDisk, node, fileSize, filename)
-	c.enforceDiskEvictionPolicy()
 	return nil
 }
 
@@ -432,7 +427,6 @@ func (c *kvCache) loadNodeFromDisk(node *trieNode) error {
 	return nil
 }
 
-// No-op when the cap is 0 (unlimited).
 func (c *kvCache) enforceDiskEvictionPolicy() {
 	diskCap := int64(envconfig.KvCacheDiskMax())
 	if diskCap <= 0 {
@@ -498,7 +492,6 @@ func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	}
 }
 
-// Returns the file size on success.
 func atomicSaveSafetensors(dir, filename string, arrays map[string]*mlx.Array, metadata map[string]string) (int64, error) {
 	// Use a .tmp_ prefix (not suffix) so the file retains the .safetensors
 	// extension that the MLX C library expects.
