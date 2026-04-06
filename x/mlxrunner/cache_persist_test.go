@@ -1182,3 +1182,123 @@ func TestFastReEvictionFromWarmCache(t *testing.T) {
 		t.Fatalf("totalDiskBytes: got %d, want %d", c.totalDiskBytes, newInfo.Size())
 	}
 }
+
+func TestFullLifecycleAsyncAndWarmCache(t *testing.T) {
+	skipIfNoMLXTest(t)
+
+	dir := t.TempDir()
+	modelID := "sha256:lifecycle"
+	numLayers := 1
+
+	// === Build and save initial trie with two branches ===
+	c := makeTestKVCache(t, numLayers)
+
+	feedTokens(c, 3)
+	branchA := c.root.appendTokens(c.root, []int32{1, 2, 3}, 3)
+	snapsA := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snapsA[j] = kv.Snapshot(0)
+	}
+	branchA.setSnapshots(snapsA, &c.pagedOutBytes)
+
+	feedTokens(c, 3)
+	branchB := c.root.appendTokens(c.root, []int32{4, 5, 6}, 3)
+	snapsB := make([]cache.Snapshot, numLayers)
+	for j, kv := range c.caches {
+		snapsB[j] = kv.Snapshot(0)
+	}
+	branchB.setSnapshots(snapsB, &c.pagedOutBytes)
+
+	if err := saveTrieTo(c, dir, modelID); err != nil {
+		t.Fatal("initial save:", err)
+	}
+
+	// === Lazy load (simulating restart) ===
+	root, pagedOut, diskBytes, referenced, err := loadTrie(dir, modelID, numLayers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root == nil {
+		t.Fatal("nil root")
+	}
+	if pagedOut != 0 {
+		t.Fatal("lazy load should have 0 pagedOut")
+	}
+	if diskBytes <= 0 {
+		t.Fatal("lazy load should have positive diskBytes")
+	}
+	cleanUnreferencedFiles(dir, referenced)
+
+	c2 := &kvCache{
+		root:           root,
+		activePath:     []*trieNode{root},
+		cacheDir:       dir,
+		modelID:        modelID,
+		totalDiskBytes: diskBytes,
+		diskWriter:     newDiskWriter(),
+	}
+	c2.caches = make([]cache.Cache, numLayers)
+	for i := range c2.caches {
+		c2.caches[i] = cache.NewKVCache()
+	}
+
+	// Identify branches (order may vary).
+	restoredA := root.children[0]
+	restoredB := root.children[1]
+	if restoredA.tokens[0] > restoredB.tokens[0] {
+		restoredA, restoredB = restoredB, restoredA
+	}
+
+	// Both lazy (on-disk).
+	if restoredA.hasSnapshots() || restoredB.hasSnapshots() {
+		t.Fatal("branches should be lazy")
+	}
+
+	// === Load branch A on demand ===
+	if err := c2.loadNodeFromDisk(restoredA); err != nil {
+		t.Fatal("load A:", err)
+	}
+	if !restoredA.hasSnapshots() {
+		t.Fatal("A should have snapshots after load")
+	}
+	warmFileA := filepath.Join(dir, nodeFileHash(restoredA))
+	if _, err := os.Stat(warmFileA); err != nil {
+		t.Fatal("warm cache file for A should exist:", err)
+	}
+
+	// === Evict A (warm fast path) ===
+	c2.activePath = []*trieNode{root}
+	infoBeforeReEvict, _ := os.Stat(warmFileA)
+
+	if err := c2.evictNodeToDisk(restoredA); err != nil {
+		t.Fatal("re-evict A:", err)
+	}
+
+	infoAfterReEvict, _ := os.Stat(warmFileA)
+	if !infoBeforeReEvict.ModTime().Equal(infoAfterReEvict.ModTime()) {
+		t.Fatal("warm re-eviction should not rewrite file")
+	}
+
+	// === Shutdown + save ===
+	c2.diskWriter.shutdown()
+	c2.processDiskCompletions()
+
+	if err := c2.saveTrie(); err != nil {
+		t.Fatal("saveTrie:", err)
+	}
+
+	// === Verify final state loads ===
+	root3, _, diskBytes3, _, err := loadTrie(dir, modelID, numLayers)
+	if err != nil {
+		t.Fatal("final loadTrie:", err)
+	}
+	if root3 == nil {
+		t.Fatal("nil root in final load")
+	}
+	if diskBytes3 <= 0 {
+		t.Fatal("final load should have positive diskBytes")
+	}
+	if len(root3.children) != 2 {
+		t.Fatalf("should have 2 branches, got %d", len(root3.children))
+	}
+}
