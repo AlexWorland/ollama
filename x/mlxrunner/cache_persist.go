@@ -78,8 +78,6 @@ func kvCacheDir(modelDigest string) (string, error) {
 	return dir, os.MkdirAll(dir, 0o700)
 }
 
-// captureActiveFrontier snapshots the active path's leaf node so its live
-// cache state is preserved before saving.
 func (c *kvCache) captureActiveFrontier() {
 	if len(c.activePath) <= 1 || len(c.caches) == 0 {
 		return
@@ -111,14 +109,7 @@ func (c *kvCache) saveTrie() error {
 
 	c.captureActiveFrontier()
 
-	// Assign sequential IDs via depth-first walk (still needed for Children references).
-	nodeMap := make(map[*trieNode]int)
-	var nodes []*trieNode
-	walkNodes(c.root, func(n *trieNode) bool {
-		nodeMap[n] = len(nodes)
-		nodes = append(nodes, n)
-		return true
-	})
+	nodes, nodeMap := indexNodes(c.root)
 
 	if len(nodes) <= 1 {
 		return nil
@@ -150,8 +141,12 @@ func (c *kvCache) saveTrie() error {
 
 			if len(arrays) > 0 {
 				hash := nodeFileHash(node)
-				if _, err := atomicSaveSafetensors(cacheDir, hash, arrays, metadata); err != nil {
-					return fmt.Errorf("save node %d: %w", nodeMap[node], err)
+				path := filepath.Join(cacheDir, hash+".safetensors")
+				if _, err := os.Stat(path); err != nil {
+					// Content-addressed file doesn't exist yet — write it.
+					if _, err := atomicSaveSafetensors(cacheDir, hash, arrays, metadata); err != nil {
+						return fmt.Errorf("save node %d: %w", nodeMap[node], err)
+					}
 				}
 				pn.File = hash
 				referenced[hash] = true
@@ -490,7 +485,6 @@ func (c *kvCache) enforceDiskEvictionPolicy() {
 	}
 }
 
-// Called after writing trie.json and on startup after loadTrie.
 func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

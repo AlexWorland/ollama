@@ -33,7 +33,6 @@ func (n *trieNode) startOffset() int {
 	return n.endOffset - len(n.tokens)
 }
 
-// snapshotBytes returns the total bytes of paged-out snapshots on this node.
 func (n *trieNode) snapshotBytes() int64 {
 	var total int64
 	for _, s := range n.snapshots {
@@ -70,12 +69,10 @@ func (n *trieNode) swapSnapshots(snaps []cache.Snapshot, counter *int64) []cache
 	return old
 }
 
-// hasSnapshots returns true if any layer has snapshot data.
 func (n *trieNode) hasSnapshots() bool {
 	return slices.ContainsFunc(n.snapshots, func(s cache.Snapshot) bool { return s != nil })
 }
 
-// hasAllSnapshots returns true if every layer has snapshot data.
 func (n *trieNode) hasAllSnapshots() bool {
 	return len(n.snapshots) > 0 && !slices.Contains(n.snapshots, nil)
 }
@@ -156,7 +153,6 @@ func (n *trieNode) appendTokens(root *trieNode, tokens []int32, endOffset int) *
 	return n
 }
 
-// removeNode removes a leaf node from the trie.
 func removeNode(node *trieNode, counter *int64) {
 	if node.parent == nil {
 		panic("removeNode called on root")
@@ -281,8 +277,6 @@ func mergeWithChild(node *trieNode, caches []cache.Cache, counter *int64) {
 	child.children = nil
 }
 
-// walkNodes calls fn for every node in the trie (depth-first).
-// If fn returns false, the walk stops.
 func walkNodes(root *trieNode, fn func(*trieNode) bool) {
 	if root == nil {
 		return
@@ -300,4 +294,17 @@ func walkNodes(root *trieNode, fn func(*trieNode) bool) {
 		return true
 	}
 	walk(root)
+}
+
+// indexNodes assigns sequential depth-first IDs to every node in the trie,
+// returning the ordered slice and a map from node pointer to index.
+func indexNodes(root *trieNode) ([]*trieNode, map[*trieNode]int) {
+	nodeMap := make(map[*trieNode]int)
+	var nodes []*trieNode
+	walkNodes(root, func(n *trieNode) bool {
+		nodeMap[n] = len(nodes)
+		nodes = append(nodes, n)
+		return true
+	})
+	return nodes, nodeMap
 }

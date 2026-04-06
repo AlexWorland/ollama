@@ -157,14 +157,7 @@ func (c *kvCache) buildTrieSnapshot() *TrieSnapshot {
 
 	activeSet := c.activeSet()
 
-	// Assign sequential IDs via depth-first walk.
-	nodeMap := make(map[*trieNode]int)
-	var ordered []*trieNode
-	walkNodes(c.root, func(n *trieNode) bool {
-		nodeMap[n] = len(ordered)
-		ordered = append(ordered, n)
-		return true
-	})
+	ordered, nodeMap := indexNodes(c.root)
 
 	var snapshotCount, diskNodeCount int
 	nodes := make([]TrieNodeInfo, len(ordered))
@@ -574,11 +567,6 @@ function handleEvent(evt) {
   };
   flashNode(range, flashMap[evt.type] || 'flash-snap');
 }
-
-fetch('/v1/cache/trie').then(function(r) { return r.json(); }).then(function(snap) {
-  renderStats(snap.stats || {});
-  renderTrie(snap);
-});
 
 var es = new EventSource('/v1/cache/events');
 es.addEventListener('init', function(e) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ func TestBuildTrieSnapshot(t *testing.T) {
 	if len(n0.Children) != 2 {
 		t.Errorf("root should have 2 children, got %d", len(n0.Children))
 	}
-	if !containsFlag(n0.Flags, "active") {
+	if !slices.Contains(n0.Flags, "active") {
 		t.Error("root should have 'active' flag")
 	}
 
@@ -65,13 +66,13 @@ func TestBuildTrieSnapshot(t *testing.T) {
 	if n1.TokenCount != 3 {
 		t.Errorf("child1 token count: got %d, want 3", n1.TokenCount)
 	}
-	if !containsFlag(n1.Flags, "active") {
+	if !slices.Contains(n1.Flags, "active") {
 		t.Error("child1 should have 'active' flag")
 	}
 
 	// child2 (id=3 in DFS: root=0, child1=1, grandchild=2, child2=3)
 	n3 := snap.Nodes[3]
-	if containsFlag(n3.Flags, "active") {
+	if slices.Contains(n3.Flags, "active") {
 		t.Error("child2 should NOT have 'active' flag")
 	}
 
@@ -80,7 +81,7 @@ func TestBuildTrieSnapshot(t *testing.T) {
 	if n2.OffsetRange != [2]int{3, 5} {
 		t.Errorf("grandchild offset range: got %v, want [3,5]", n2.OffsetRange)
 	}
-	if !containsFlag(n2.Flags, "active") {
+	if !slices.Contains(n2.Flags, "active") {
 		t.Error("grandchild should have 'active' flag")
 	}
 }
@@ -113,7 +114,7 @@ func TestBuildTrieSnapshotWithDiskNode(t *testing.T) {
 	}
 
 	n1 := snap.Nodes[1]
-	if !containsFlag(n1.Flags, "disk") {
+	if !slices.Contains(n1.Flags, "disk") {
 		t.Error("child should have 'disk' flag")
 	}
 	if n1.DiskFile != "evicted_0.safetensors" {
@@ -432,14 +433,4 @@ func TestHandleCacheEventsSSE(t *testing.T) {
 	}
 }
 
-// ---------- Helpers ----------
-
-func containsFlag(flags []string, flag string) bool {
-	for _, f := range flags {
-		if f == flag {
-			return true
-		}
-	}
-	return false
-}
 
