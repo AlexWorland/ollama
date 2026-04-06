@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ollama/ollama/internal/httputil"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
@@ -319,7 +320,7 @@ func (c *kvCache) handleCacheEvents(w http.ResponseWriter, r *http.Request) {
 	// because EventSnapshot emits CacheEvent payloads through the bus,
 	// which have a different schema than the TrieSnapshot sent here.
 	if snap := c.trieSnapshot.Load(); snap != nil {
-		writeSSE(w, "init", snap)
+		httputil.WriteSSE(w, "init", snap)
 	}
 
 	ch, unsub := c.events.subscribe()
@@ -333,25 +334,11 @@ func (c *kvCache) handleCacheEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if err := writeSSE(w, string(event.Type), event); err != nil {
+			if err := httputil.WriteSSE(w, string(event.Type), event); err != nil {
 				return
 			}
 		}
 	}
-}
-
-func writeSSE(w http.ResponseWriter, eventType string, data any) error {
-	d, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, d); err != nil {
-		return err
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	return nil
 }
 
 // ---------------- Embedded HTML dashboard ----------------

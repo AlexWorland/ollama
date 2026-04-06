@@ -17,6 +17,7 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
+	"github.com/ollama/ollama/internal/httputil"
 	"github.com/ollama/ollama/internal/modelref"
 	"github.com/ollama/ollama/logutil"
 )
@@ -48,7 +49,7 @@ func (w *AnthropicWriter) writeError(data []byte) (int, error) {
 }
 
 func (w *AnthropicWriter) writeEvent(eventType string, data any) error {
-	return writeSSE(w.ResponseWriter, eventType, data)
+	return httputil.WriteSSE(w.ResponseWriter, eventType, data)
 }
 
 func (w *AnthropicWriter) writeResponse(data []byte) (int, error) {
@@ -611,7 +612,7 @@ func (w *WebSearchAnthropicWriter) writePassthroughStreamChunk(chatResponse api.
 			w.terminalSent = true
 		}
 
-		if err := writeSSE(w.ResponseWriter, event.Event, event.Data); err != nil {
+		if err := httputil.WriteSSE(w.ResponseWriter, event.Event, event.Data); err != nil {
 			return err
 		}
 	}
@@ -629,7 +630,7 @@ func (w *WebSearchAnthropicWriter) ensureStreamMessageStart(usage anthropic.Usag
 		inputTokens = w.estimatedInputTokens
 	}
 
-	if err := writeSSE(w.ResponseWriter, "message_start", anthropic.MessageStartEvent{
+	if err := httputil.WriteSSE(w.ResponseWriter, "message_start", anthropic.MessageStartEvent{
 		Type: "message_start",
 		Message: anthropic.MessagesResponse{
 			ID:      w.inner.id,
@@ -654,7 +655,7 @@ func (w *WebSearchAnthropicWriter) closeOpenStreamBlock() error {
 		return nil
 	}
 
-	if err := writeSSE(w.ResponseWriter, "content_block_stop", anthropic.ContentBlockStopEvent{
+	if err := httputil.WriteSSE(w.ResponseWriter, "content_block_stop", anthropic.ContentBlockStopEvent{
 		Type:  "content_block_stop",
 		Index: w.streamOpenBlockIndex,
 	}); err != nil {
@@ -673,7 +674,7 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 		index := w.streamNextIndex
 		if block.Type == "text" {
 			emptyText := ""
-			if err := writeSSE(w.ResponseWriter, "content_block_start", anthropic.ContentBlockStartEvent{
+			if err := httputil.WriteSSE(w.ResponseWriter, "content_block_start", anthropic.ContentBlockStartEvent{
 				Type:  "content_block_start",
 				Index: index,
 				ContentBlock: anthropic.ContentBlock{
@@ -688,7 +689,7 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 			if block.Text != nil {
 				text = *block.Text
 			}
-			if err := writeSSE(w.ResponseWriter, "content_block_delta", anthropic.ContentBlockDeltaEvent{
+			if err := httputil.WriteSSE(w.ResponseWriter, "content_block_delta", anthropic.ContentBlockDeltaEvent{
 				Type:  "content_block_delta",
 				Index: index,
 				Delta: anthropic.Delta{
@@ -699,7 +700,7 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 				return err
 			}
 		} else {
-			if err := writeSSE(w.ResponseWriter, "content_block_start", anthropic.ContentBlockStartEvent{
+			if err := httputil.WriteSSE(w.ResponseWriter, "content_block_start", anthropic.ContentBlockStartEvent{
 				Type:         "content_block_start",
 				Index:        index,
 				ContentBlock: block,
@@ -708,7 +709,7 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 			}
 		}
 
-		if err := writeSSE(w.ResponseWriter, "content_block_stop", anthropic.ContentBlockStopEvent{
+		if err := httputil.WriteSSE(w.ResponseWriter, "content_block_stop", anthropic.ContentBlockStopEvent{
 			Type:  "content_block_stop",
 			Index: index,
 		}); err != nil {
@@ -745,7 +746,7 @@ func (w *WebSearchAnthropicWriter) writeTerminalResponse(response anthropic.Mess
 		return err
 	}
 
-	if err := writeSSE(w.ResponseWriter, "message_delta", anthropic.MessageDeltaEvent{
+	if err := httputil.WriteSSE(w.ResponseWriter, "message_delta", anthropic.MessageDeltaEvent{
 		Type: "message_delta",
 		Delta: anthropic.MessageDelta{
 			StopReason: response.StopReason,
@@ -758,7 +759,7 @@ func (w *WebSearchAnthropicWriter) writeTerminalResponse(response anthropic.Mess
 		return err
 	}
 
-	if err := writeSSE(w.ResponseWriter, "message_stop", anthropic.MessageStopEvent{
+	if err := httputil.WriteSSE(w.ResponseWriter, "message_stop", anthropic.MessageStopEvent{
 		Type: "message_stop",
 	}); err != nil {
 		return err
@@ -928,20 +929,6 @@ func extractQueryFromToolCall(tc *api.ToolCall) string {
 }
 
 // writeSSE writes a Server-Sent Event
-func writeSSE(w http.ResponseWriter, eventType string, data any) error {
-	d, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, d); err != nil {
-		return err
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	return nil
-}
-
 // queryArgs creates a ToolCallFunctionArguments with a single "query" key.
 func queryArgs(query string) api.ToolCallFunctionArguments {
 	args := api.NewToolCallFunctionArguments()
