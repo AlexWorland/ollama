@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -376,6 +377,31 @@ func TestHandleTrieSnapshotNilSnapshot(t *testing.T) {
 	}
 }
 
+// syncRecorder wraps httptest.ResponseRecorder with a mutex so the test
+// goroutine can safely observe Body while the handler goroutine writes.
+type syncRecorder struct {
+	*httptest.ResponseRecorder
+	mu sync.Mutex
+}
+
+func (r *syncRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ResponseRecorder.Write(p)
+}
+
+func (r *syncRecorder) Flush() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ResponseRecorder.Flush()
+}
+
+func (r *syncRecorder) bodyString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ResponseRecorder.Body.String()
+}
+
 func TestHandleCacheEventsSSE(t *testing.T) {
 	c := &kvCache{events: newCacheEventBus()}
 
@@ -390,7 +416,7 @@ func TestHandleCacheEventsSSE(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req = req.WithContext(ctx)
-	w := httptest.NewRecorder()
+	w := &syncRecorder{ResponseRecorder: httptest.NewRecorder()}
 
 	done := make(chan struct{})
 	go func() {
@@ -416,12 +442,18 @@ func TestHandleCacheEventsSSE(t *testing.T) {
 		Bytes:       2048,
 	})
 
-	// Give handler time to write, then cancel.
-	time.Sleep(50 * time.Millisecond)
+	// Wait for the emitted event to hit the response body, then cancel.
+	writeDeadline := time.Now().Add(time.Second)
+	for !strings.Contains(w.bodyString(), "event: page_out") {
+		if time.Now().After(writeDeadline) {
+			t.Fatal("timed out waiting for page_out event in SSE body")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	cancel()
 	<-done
 
-	body := w.Body.String()
+	body := w.bodyString()
 	if !strings.Contains(body, "event: init") {
 		t.Error("SSE stream should start with initial init event")
 	}
