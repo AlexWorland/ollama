@@ -5,23 +5,40 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// waitForResults polls drainResults until at least n completions are seen
+// or the deadline is exceeded. Accumulates results across poll rounds.
+func waitForResults(t *testing.T, w *diskWriter, n int) []diskWriteResult {
+	t.Helper()
+	var all []diskWriteResult
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		all = append(all, w.drainResults()...)
+		if len(all) >= n {
+			return all
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d results, got %d", n, len(all))
+	return nil
+}
 
 func TestDiskWriterWritesFile(t *testing.T) {
 	dir := t.TempDir()
-	w := newDiskWriter()
+	w := newDiskWriter(dir)
 	defer w.shutdown()
 
 	data := []byte("hello safetensors content")
 	w.submit(diskWriteJob{
 		data:     data,
 		filename: "test.safetensors",
-		dir:      dir,
 	})
 
-	result := <-w.results
-	if result.err != nil {
-		t.Fatal("write failed:", result.err)
+	results := waitForResults(t, w, 1)
+	if results[0].err != nil {
+		t.Fatal("write failed:", results[0].err)
 	}
 
 	got, err := os.ReadFile(filepath.Join(dir, "test.safetensors"))
@@ -34,30 +51,28 @@ func TestDiskWriterWritesFile(t *testing.T) {
 }
 
 func TestDiskWriterFailure(t *testing.T) {
-	w := newDiskWriter()
+	w := newDiskWriter("/nonexistent/path/that/does/not/exist")
 	defer w.shutdown()
 
 	w.submit(diskWriteJob{
 		data:     []byte("data"),
 		filename: "test.safetensors",
-		dir:      "/nonexistent/path/that/does/not/exist",
 	})
 
-	result := <-w.results
-	if result.err == nil {
+	results := waitForResults(t, w, 1)
+	if results[0].err == nil {
 		t.Fatal("expected error for bad directory")
 	}
 }
 
 func TestDiskWriterWaitForFile(t *testing.T) {
 	dir := t.TempDir()
-	w := newDiskWriter()
+	w := newDiskWriter(dir)
 	defer w.shutdown()
 
 	w.submit(diskWriteJob{
 		data:     []byte("content"),
 		filename: "wait.safetensors",
-		dir:      dir,
 	})
 
 	w.waitForFile("wait.safetensors")
@@ -65,27 +80,23 @@ func TestDiskWriterWaitForFile(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "wait.safetensors")); err != nil {
 		t.Fatal("file should exist after waitForFile:", err)
 	}
-
-	<-w.results // drain
 }
 
 func TestDiskWriterWaitForFileNotInFlight(t *testing.T) {
-	w := newDiskWriter()
+	w := newDiskWriter(t.TempDir())
 	defer w.shutdown()
 
-	// Should return immediately for unknown files.
 	w.waitForFile("nonexistent.safetensors")
 }
 
 func TestDiskWriterShutdown(t *testing.T) {
 	dir := t.TempDir()
-	w := newDiskWriter()
+	w := newDiskWriter(dir)
 
 	for i := range 5 {
 		w.submit(diskWriteJob{
 			data:     []byte(fmt.Sprintf("data_%d", i)),
 			filename: fmt.Sprintf("file_%d.safetensors", i),
-			dir:      dir,
 		})
 	}
 
@@ -98,8 +109,7 @@ func TestDiskWriterShutdown(t *testing.T) {
 		}
 	}
 
-	// Drain all results.
-	for range 5 {
-		<-w.results
+	if got := len(w.drainResults()); got != 5 {
+		t.Fatalf("expected 5 results after shutdown, got %d", got)
 	}
 }

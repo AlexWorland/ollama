@@ -98,7 +98,7 @@ func ExportSnapshot(s Snapshot) *SnapshotExport {
 func ImportSnapshot(typ SnapshotType, arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {
 	switch typ {
 	case SnapshotTypeKV:
-		return importKVSnapshot(arrays, meta)
+		return importKVFields(arrays, meta, "kv")
 	case SnapshotTypeRotating:
 		return importRotatingSnapshot(arrays, meta)
 	case SnapshotTypeRecurrent:
@@ -135,10 +135,6 @@ func importKVFields(arrays map[string]*mlx.Array, meta map[string]string, label 
 		fromOffset: fromOffset,
 		toOffset:   toOffset,
 	}, nil
-}
-
-func importKVSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {
-	return importKVFields(arrays, meta, "kv")
 }
 
 func importRotatingSnapshot(arrays map[string]*mlx.Array, meta map[string]string) (Snapshot, error) {

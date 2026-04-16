@@ -248,9 +248,9 @@ func (r *Runner) restoreCache() {
 	// even when no prior cache is restored.
 	r.cache.cacheDir = dir
 	r.cache.modelID = r.modelDigest
-	r.cache.diskWriter = newDiskWriter()
+	r.cache.diskWriter = newDiskWriter(dir)
 
-	root, pagedOut, diskBytes, referenced, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
+	root, diskBytes, referenced, err := loadTrie(dir, r.modelDigest, len(r.cache.caches))
 	if err != nil {
 		slog.Warn("failed to load cached KV trie", "error", err)
 		return
@@ -267,22 +267,21 @@ func (r *Runner) restoreCache() {
 
 	r.cache.root = root
 	r.cache.activePath = []*trieNode{root}
-	r.cache.pagedOutBytes = pagedOut
 	r.cache.totalDiskBytes = diskBytes
 	slog.Info("restored KV cache from disk",
-		"paged_out", mlx.PrettyBytes(int(pagedOut)),
 		"disk_bytes", mlx.PrettyBytes(int(diskBytes)))
 }
 
 func (r *Runner) saveCache() {
-	if r.cache.root == nil || r.cache.cacheDir == "" {
-		return
-	}
-
-	// Drain all pending async writes before saving trie.
+	// Always drain async writes so workers exit cleanly, even when there's
+	// nothing to persist (e.g. session ended before any eviction).
 	if r.cache.diskWriter != nil {
 		r.cache.diskWriter.shutdown()
 		r.cache.processDiskCompletions()
+	}
+
+	if r.cache.root == nil || r.cache.cacheDir == "" {
+		return
 	}
 
 	if err := r.cache.saveTrie(); err != nil {

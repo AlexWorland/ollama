@@ -6,10 +6,9 @@ import (
 )
 
 type diskWriteJob struct {
-	data     []byte    // pre-serialized safetensors bytes
-	filename string    // content-addressed name (e.g. "abc123.safetensors")
-	dir      string    // cache directory path
-	node     *trieNode // passed through to result (not dereferenced by worker)
+	data     []byte
+	filename string
+	node     *trieNode
 }
 
 type diskWriteResult struct {
@@ -18,20 +17,24 @@ type diskWriteResult struct {
 }
 
 // diskWriter runs background goroutines that write pre-serialized bytes to
-// content-addressed files. The inference goroutine serializes arrays and submits
-// jobs; workers handle only pure Go file I/O. Content-addressed filenames
-// guarantee no write conflicts between workers.
+// content-addressed files under a fixed directory. Content-addressed names
+// guarantee no write conflicts between workers. The inference goroutine
+// serializes arrays and submits jobs; workers handle only file I/O.
 type diskWriter struct {
-	jobs     chan diskWriteJob    // buffered: absorbs burst evictions without blocking inference
-	results  chan diskWriteResult // buffered: same size as jobs
-	inFlight sync.Map            // filename -> *sync.WaitGroup (for load-race handling)
-	done     sync.WaitGroup      // tracks all workers for graceful shutdown
+	dir  string
+	jobs chan diskWriteJob
+	done sync.WaitGroup
+
+	mu       sync.Mutex
+	inFlight map[string]*sync.WaitGroup
+	results  []diskWriteResult
 }
 
-func newDiskWriter() *diskWriter {
+func newDiskWriter(dir string) *diskWriter {
 	w := &diskWriter{
-		jobs:    make(chan diskWriteJob, 8),
-		results: make(chan diskWriteResult, 8),
+		dir:      dir,
+		jobs:     make(chan diskWriteJob, 8),
+		inFlight: make(map[string]*sync.WaitGroup),
 	}
 	w.done.Add(2)
 	for range 2 {
@@ -43,42 +46,54 @@ func newDiskWriter() *diskWriter {
 func (w *diskWriter) worker() {
 	defer w.done.Done()
 	for job := range w.jobs {
-		tmpPath := filepath.Join(job.dir, ".tmp_"+job.filename)
-		finalPath := filepath.Join(job.dir, job.filename)
+		tmpPath := filepath.Join(w.dir, ".tmp_"+job.filename)
+		finalPath := filepath.Join(w.dir, job.filename)
 		err := atomicWriteFile(tmpPath, finalPath, job.data)
 
-		// Signal waiters and clean up inFlight entry.
-		if v, ok := w.inFlight.LoadAndDelete(job.filename); ok {
-			v.(*sync.WaitGroup).Done()
+		w.mu.Lock()
+		if wg, ok := w.inFlight[job.filename]; ok {
+			delete(w.inFlight, job.filename)
+			wg.Done()
 		}
-
-		w.results <- diskWriteResult{
-			node: job.node,
-			err:  err,
-		}
+		w.results = append(w.results, diskWriteResult{node: job.node, err: err})
+		w.mu.Unlock()
 	}
 }
 
 // submit enqueues a write job. The inFlight WaitGroup is registered before
-// sending to the channel so waitForFile is correct even if called before
-// the worker picks up the job.
+// enqueueing so waitForFile is correct even if called before a worker picks
+// up the job. Blocks briefly if the jobs buffer is full.
 func (w *diskWriter) submit(job diskWriteJob) {
-	var wg sync.WaitGroup
+	wg := &sync.WaitGroup{}
 	wg.Add(1)
-	w.inFlight.Store(job.filename, &wg)
+	w.mu.Lock()
+	w.inFlight[job.filename] = wg
+	w.mu.Unlock()
 	w.jobs <- job
 }
 
 // waitForFile blocks until the named file's async write completes. Returns
-// immediately if the file is not in-flight (sync.Map lookup miss -- fast path).
+// immediately if the file is not in-flight.
 func (w *diskWriter) waitForFile(filename string) {
-	if v, ok := w.inFlight.Load(filename); ok {
-		v.(*sync.WaitGroup).Wait()
+	w.mu.Lock()
+	wg := w.inFlight[filename]
+	w.mu.Unlock()
+	if wg != nil {
+		wg.Wait()
 	}
 }
 
+// drainResults returns all completed writes accumulated since the last call.
+func (w *diskWriter) drainResults() []diskWriteResult {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := w.results
+	w.results = nil
+	return out
+}
+
 // shutdown closes the jobs channel and waits for all workers to finish.
-// Results remain in the channel for the caller to drain via processDiskCompletions.
+// Remaining results can be read with drainResults.
 func (w *diskWriter) shutdown() {
 	close(w.jobs)
 	w.done.Wait()

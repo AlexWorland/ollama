@@ -114,7 +114,7 @@ func TestSaveLoadTrieRoundTrip(t *testing.T) {
 	}
 
 	// Load lazily.
-	root, _, diskBytes, _, err := loadTrie(dir, modelID, numLayers)
+	root, diskBytes, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
@@ -195,7 +195,7 @@ func TestLoadTrieModelMismatch(t *testing.T) {
 	}
 
 	// Loading with a different model ID should return nil root.
-	root, _, _, _, err := loadTrie(dir, "sha256:model_b", numLayers)
+	root, _, _, err := loadTrie(dir, "sha256:model_b", numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 	}
 
 	// Loading with different layer count should return nil root.
-	root, _, _, _, err := loadTrie(dir, modelID, 4)
+	root, _, _, err := loadTrie(dir, modelID, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,15 +232,12 @@ func TestLoadTrieLayerCountMismatch(t *testing.T) {
 
 func TestLoadTrieNoFile(t *testing.T) {
 	dir := t.TempDir()
-	root, pagedOut, _, _, err := loadTrie(dir, "sha256:test", 2)
+	root, _, _, err := loadTrie(dir, "sha256:test", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if root != nil {
 		t.Fatal("expected nil root when no trie.json exists")
-	}
-	if pagedOut != 0 {
-		t.Fatal("expected 0 paged out bytes")
 	}
 }
 
@@ -327,7 +324,7 @@ func TestSaveLoadBranchingTrie(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, _, _, _, err := loadTrie(dir, modelID, numLayers)
+	root, _, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,7 +558,7 @@ func TestSaveTrieWithColdNodes(t *testing.T) {
 	}
 
 	// Load and verify the cold node round-trips (lazy: diskFile set, no snapshots).
-	root, _, _, _, err := loadTrie(dir, modelID, numLayers)
+	root, _, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
@@ -767,15 +764,12 @@ func TestCrashSafetyPartialSave(t *testing.T) {
 	}
 
 	// Load should succeed (old trie.json + old hash files are consistent).
-	root, pagedOut, _, referenced, err := loadTrie(dir, modelID, numLayers)
+	root, _, referenced, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("loadTrie:", err)
 	}
 	if root == nil {
 		t.Fatal("nil root — crash should not corrupt existing save")
-	}
-	if pagedOut != 0 {
-		t.Fatal("lazy load should have 0 pagedOut")
 	}
 
 	// Cleanup should remove the orphan.
@@ -799,7 +793,7 @@ func TestProcessDiskCompletionsOnFailure(t *testing.T) {
 	numLayers := 1
 	c := makeTestKVCache(t, numLayers)
 	c.cacheDir = t.TempDir()
-	c.diskWriter = newDiskWriter()
+	c.diskWriter = newDiskWriter(c.cacheDir)
 	defer c.diskWriter.shutdown()
 
 	feedTokens(c, 3)
@@ -814,10 +808,12 @@ func TestProcessDiskCompletionsOnFailure(t *testing.T) {
 	leaf.setSnapshots(nil, &c.pagedOutBytes)
 	c.totalDiskBytes = 1000
 
-	c.diskWriter.results <- diskWriteResult{
+	c.diskWriter.mu.Lock()
+	c.diskWriter.results = append(c.diskWriter.results, diskWriteResult{
 		node: leaf,
 		err:  fmt.Errorf("simulated write failure"),
-	}
+	})
+	c.diskWriter.mu.Unlock()
 
 	c.processDiskCompletions()
 
@@ -838,7 +834,7 @@ func TestAsyncEvictNodeToDisk(t *testing.T) {
 	numLayers := 2
 	c := makeTestKVCache(t, numLayers)
 	c.cacheDir = t.TempDir()
-	c.diskWriter = newDiskWriter()
+	c.diskWriter = newDiskWriter(c.cacheDir)
 	defer c.diskWriter.shutdown()
 
 	feedTokens(c, 3)
@@ -858,7 +854,6 @@ func TestAsyncEvictNodeToDisk(t *testing.T) {
 
 	// Wait for background write.
 	c.diskWriter.waitForFile(filepath.Base(leaf.diskFile))
-	<-c.diskWriter.results
 
 	if _, err := os.Stat(leaf.diskFile); err != nil {
 		t.Fatal("file should exist after async write:", err)
@@ -871,7 +866,7 @@ func TestLoadNodeFromDiskWaitsForInFlight(t *testing.T) {
 	numLayers := 2
 	c := makeTestKVCache(t, numLayers)
 	c.cacheDir = t.TempDir()
-	c.diskWriter = newDiskWriter()
+	c.diskWriter = newDiskWriter(c.cacheDir)
 	defer c.diskWriter.shutdown()
 
 	feedTokens(c, 3)
@@ -891,8 +886,6 @@ func TestLoadNodeFromDiskWaitsForInFlight(t *testing.T) {
 	if !leaf.hasSnapshots() {
 		t.Fatal("snapshots should be restored")
 	}
-
-	<-c.diskWriter.results // drain
 }
 
 func TestLazyLoadTrieRoundTrip(t *testing.T) {
@@ -912,15 +905,12 @@ func TestLazyLoadTrieRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, pagedOut, diskBytes, referenced, err := loadTrie(dir, modelID, numLayers)
+	root, diskBytes, referenced, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if root == nil {
 		t.Fatal("nil root")
-	}
-	if pagedOut != 0 {
-		t.Fatalf("lazy load pagedOut should be 0, got %d", pagedOut)
 	}
 	if diskBytes <= 0 {
 		t.Fatalf("diskBytes should be positive, got %d", diskBytes)
@@ -969,7 +959,7 @@ func TestLazyLoadTrieMissingFile(t *testing.T) {
 		}
 	}
 
-	root, _, diskBytes, _, err := loadTrie(dir, modelID, numLayers)
+	root, diskBytes, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -991,7 +981,7 @@ func TestShutdownDrainsAsyncWrites(t *testing.T) {
 	numLayers := 1
 	c := makeTestKVCache(t, numLayers)
 	c.cacheDir = t.TempDir()
-	c.diskWriter = newDiskWriter()
+	c.diskWriter = newDiskWriter(c.cacheDir)
 
 	var leaves []*trieNode
 	for i := range 3 {
@@ -1122,15 +1112,12 @@ func TestFullLifecycleAsyncAndWarmCache(t *testing.T) {
 	}
 
 	// === Lazy load (simulating restart) ===
-	root, pagedOut, diskBytes, referenced, err := loadTrie(dir, modelID, numLayers)
+	root, diskBytes, referenced, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if root == nil {
 		t.Fatal("nil root")
-	}
-	if pagedOut != 0 {
-		t.Fatal("lazy load should have 0 pagedOut")
 	}
 	if diskBytes <= 0 {
 		t.Fatal("lazy load should have positive diskBytes")
@@ -1143,7 +1130,7 @@ func TestFullLifecycleAsyncAndWarmCache(t *testing.T) {
 		cacheDir:       dir,
 		modelID:        modelID,
 		totalDiskBytes: diskBytes,
-		diskWriter:     newDiskWriter(),
+		diskWriter:     newDiskWriter(dir),
 	}
 	c2.caches = make([]cache.Cache, numLayers)
 	for i := range c2.caches {
@@ -1196,7 +1183,7 @@ func TestFullLifecycleAsyncAndWarmCache(t *testing.T) {
 	}
 
 	// === Verify final state loads ===
-	root3, _, diskBytes3, _, err := loadTrie(dir, modelID, numLayers)
+	root3, diskBytes3, _, err := loadTrie(dir, modelID, numLayers)
 	if err != nil {
 		t.Fatal("final loadTrie:", err)
 	}

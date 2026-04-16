@@ -180,37 +180,37 @@ func (c *kvCache) saveTrie() error {
 // loadTrie deserializes the trie from cacheDir. Nodes with disk-backed files
 // are restored lazily: diskFile/diskFileSize/snapTypes are set from metadata,
 // but no safetensors files are opened. Actual loading happens on demand via
-// loadNodeFromDisk. Returns (root, pagedOutBytes=0, totalDiskBytes, referenced, error).
-func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, int64, map[string]bool, error) {
+// loadNodeFromDisk.
+func loadTrie(cacheDir, modelID string, numLayers int) (root *trieNode, totalDiskBytes int64, referenced map[string]bool, err error) {
 	triePath := filepath.Join(cacheDir, "trie.json")
 	data, err := os.ReadFile(triePath)
 	if os.IsNotExist(err) {
-		return nil, 0, 0, nil, nil
+		return nil, 0, nil, nil
 	}
 	if err != nil {
-		return nil, 0, 0, nil, fmt.Errorf("read trie.json: %w", err)
+		return nil, 0, nil, fmt.Errorf("read trie.json: %w", err)
 	}
 
 	var persisted persistedTrie
 	if err := json.Unmarshal(data, &persisted); err != nil {
-		return nil, 0, 0, nil, fmt.Errorf("parse trie.json: %w", err)
+		return nil, 0, nil, fmt.Errorf("parse trie.json: %w", err)
 	}
 
 	if persisted.Version != trieFormatVersion {
 		slog.Info("ignoring cached trie: version mismatch", "file", persisted.Version, "expected", trieFormatVersion)
-		return nil, 0, 0, nil, nil
+		return nil, 0, nil, nil
 	}
 	if persisted.ModelID != modelID {
 		slog.Info("ignoring cached trie: model mismatch", "cached", persisted.ModelID, "current", modelID)
-		return nil, 0, 0, nil, nil
+		return nil, 0, nil, nil
 	}
 	if persisted.NumLayers != numLayers {
 		slog.Info("ignoring cached trie: layer count mismatch", "cached", persisted.NumLayers, "current", numLayers)
-		return nil, 0, 0, nil, nil
+		return nil, 0, nil, nil
 	}
 
 	if len(persisted.Nodes) == 0 {
-		return nil, 0, 0, nil, nil
+		return nil, 0, nil, nil
 	}
 
 	trieNodes := make([]*trieNode, len(persisted.Nodes))
@@ -226,7 +226,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, int64,
 	for i, pn := range persisted.Nodes {
 		for _, childID := range pn.Children {
 			if childID < 0 || childID >= len(trieNodes) {
-				return nil, 0, 0, nil, fmt.Errorf("node %d references invalid child %d", i, childID)
+				return nil, 0, nil, fmt.Errorf("node %d references invalid child %d", i, childID)
 			}
 			child := trieNodes[childID]
 			child.parent = trieNodes[i]
@@ -234,9 +234,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, int64,
 		}
 	}
 
-	// Lazy loading: record disk state via os.Stat instead of reading files.
-	referenced := make(map[string]bool)
-	var totalDiskBytes int64
+	referenced = make(map[string]bool)
 	for i, pn := range persisted.Nodes {
 		if pn.File == "" || len(pn.SnapTypes) == 0 {
 			continue
@@ -263,8 +261,7 @@ func loadTrie(cacheDir, modelID string, numLayers int) (*trieNode, int64, int64,
 		totalDiskBytes += info.Size()
 	}
 
-	root := trieNodes[0]
-	return root, 0, totalDiskBytes, referenced, nil
+	return trieNodes[0], totalDiskBytes, referenced, nil
 }
 
 func closeSnapshots(snaps []cache.Snapshot) {
@@ -329,7 +326,6 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 		return fmt.Errorf("cacheDir not set")
 	}
 
-	// Fast path: reuse warm cache file from a previous eviction.
 	filename := nodeFileHash(node)
 	warmPath := filepath.Join(c.cacheDir, filename)
 	if info, err := os.Stat(warmPath); err == nil {
@@ -344,13 +340,11 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 		return nil
 	}
 
-	// Slow path: serialize + async write.
 	arrays, metadata, snapTypes := exportNodeSnapshots(node.snapshots)
 	if len(arrays) == 0 {
 		return fmt.Errorf("no arrays to evict")
 	}
 
-	// Phase 1 (inference goroutine): materialize lazy tensors and serialize.
 	mlx.Eval(slices.Collect(maps.Values(arrays))...)
 
 	data, err := mlx.SerializeSafetensors(arrays, metadata)
@@ -361,7 +355,7 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 	slog.Info("evicting node to disk", "offset", node.startOffset(),
 		"tokens", len(node.tokens), "bytes", node.snapshotBytes(), "path", filename)
 
-	// Set disk state optimistically -- corrected on failure by processDiskCompletions.
+	// Disk state is optimistic; processDiskCompletions corrects it on failure.
 	node.snapTypes = snapTypes
 	node.diskFile = filepath.Join(c.cacheDir, filename)
 	node.diskFileSize = int64(len(data))
@@ -370,16 +364,14 @@ func (c *kvCache) evictNodeToDisk(node *trieNode) error {
 
 	c.emitEvent(EventEvictToDisk, node, int64(len(data)), filename)
 
-	// Phase 2: write bytes to file.
 	if c.diskWriter != nil {
 		c.diskWriter.submit(diskWriteJob{
 			data:     data,
 			filename: filename,
-			dir:      c.cacheDir,
 			node:     node,
 		})
 	} else {
-		// Synchronous fallback (tests without diskWriter).
+		// Synchronous fallback for tests without a diskWriter.
 		tmpPath := filepath.Join(c.cacheDir, ".tmp_"+filename)
 		finalPath := filepath.Join(c.cacheDir, filename)
 		if err := atomicWriteFile(tmpPath, finalPath, data); err != nil {
@@ -492,19 +484,15 @@ func (c *kvCache) processDiskCompletions() {
 	if c.diskWriter == nil {
 		return
 	}
-	for {
-		select {
-		case result := <-c.diskWriter.results:
-			if result.err != nil {
-				slog.Warn("async disk write failed", "error", result.err,
-					"file", filepath.Base(result.node.diskFile))
-				c.clearNodeDiskState(result.node)
-				if len(result.node.children) == 0 {
-					removeNode(result.node, &c.pagedOutBytes)
-				}
-			}
-		default:
-			return
+	for _, result := range c.diskWriter.drainResults() {
+		if result.err == nil {
+			continue
+		}
+		slog.Warn("async disk write failed", "error", result.err,
+			"file", filepath.Base(result.node.diskFile))
+		c.clearNodeDiskState(result.node)
+		if len(result.node.children) == 0 {
+			removeNode(result.node, &c.pagedOutBytes)
 		}
 	}
 }
