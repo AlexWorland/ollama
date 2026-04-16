@@ -1,6 +1,7 @@
 package mlx
 
 import (
+	"bytes"
 	"os"
 	"testing"
 )
@@ -90,5 +91,75 @@ func TestSerializeSafetensorsEmptyArrays(t *testing.T) {
 	_, err := SerializeSafetensors(nil, nil)
 	if err != nil {
 		t.Fatal("should succeed with empty input:", err)
+	}
+}
+
+// TestSerializeSafetensorsToMatchesBuffered proves that the streaming and
+// buffered encoders produce byte-identical output, so callers can switch
+// to the streaming API without format concerns.
+func TestSerializeSafetensorsToMatchesBuffered(t *testing.T) {
+	skipIfNoMLX(t)
+
+	a := Zeros(DTypeFloat16, 1, 4, 1, 8)
+	b := Zeros(DTypeFloat32, 2, 3)
+	Eval(a, b)
+
+	arrays := map[string]*Array{"keys": a, "values": b}
+	metadata := map[string]string{"from_offset": "0", "to_offset": "5"}
+
+	buffered, err := SerializeSafetensors(arrays, metadata)
+	if err != nil {
+		t.Fatal("SerializeSafetensors:", err)
+	}
+
+	var streamed bytes.Buffer
+	if err := SerializeSafetensorsTo(&streamed, arrays, metadata); err != nil {
+		t.Fatal("SerializeSafetensorsTo:", err)
+	}
+
+	if !bytes.Equal(buffered, streamed.Bytes()) {
+		t.Fatalf("streaming output differs from buffered: len=%d vs %d",
+			len(buffered), streamed.Len())
+	}
+}
+
+// TestSerializeSafetensorsToFileRoundTrip verifies that streaming directly
+// to a file produces a file the MLX C loader can read.
+func TestSerializeSafetensorsToFileRoundTrip(t *testing.T) {
+	skipIfNoMLX(t)
+
+	a := Zeros(DTypeFloat16, 1, 4, 1, 8)
+	Eval(a)
+	arrays := map[string]*Array{"keys": a}
+	metadata := map[string]string{"from_offset": "0", "to_offset": "5"}
+
+	path := t.TempDir() + "/stream.safetensors"
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SerializeSafetensorsTo(f, arrays, metadata); err != nil {
+		f.Close()
+		t.Fatal("SerializeSafetensorsTo:", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sf, err := LoadSafetensorsNative(path)
+	if err != nil {
+		t.Fatal("LoadSafetensorsNative:", err)
+	}
+	defer sf.Free()
+
+	loaded := sf.Get("keys")
+	if loaded == nil {
+		t.Fatal("keys not found in streamed file")
+	}
+	if loaded.DType() != DTypeFloat16 {
+		t.Fatalf("dtype: got %v, want F16", loaded.DType())
+	}
+	if sf.GetMetadata("to_offset") != "5" {
+		t.Fatalf("metadata lost: to_offset=%q", sf.GetMetadata("to_offset"))
 	}
 }
