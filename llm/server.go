@@ -1833,6 +1833,14 @@ func (s *ollamaServer) Detokenize(ctx context.Context, tokens []int) (string, er
 	return content, nil
 }
 
+// Shutdown timing for the runner subprocess. SIGTERM gives the runner time to
+// flush disk-backed state (e.g. KV cache persistence in x/mlxrunner/) before
+// we escalate to SIGKILL. Large caches on slow disks may need several seconds.
+const (
+	runnerShutdownGracePeriod = 30 * time.Second
+	runnerKillWait            = 2 * time.Second
+)
+
 func (s *llmServer) Close() error {
 	s.llamaModelLock.Lock()
 	if s.llamaModel != nil {
@@ -1854,7 +1862,7 @@ func (s *llmServer) Close() error {
 			select {
 			case <-s.done:
 				// Exited gracefully.
-			case <-time.After(5 * time.Second):
+			case <-time.After(runnerShutdownGracePeriod):
 				slog.Debug("runner did not exit after SIGTERM, sending SIGKILL", "pid", s.Pid())
 				s.cmd.Process.Kill()
 			}
@@ -1865,7 +1873,7 @@ func (s *llmServer) Close() error {
 			slog.Debug("waiting for llama server to exit", "pid", s.Pid())
 			select {
 			case <-s.done:
-			case <-time.After(2 * time.Second):
+			case <-time.After(runnerKillWait):
 				slog.Warn("runner process did not exit after kill, abandoning wait", "pid", s.Pid())
 			}
 		}
