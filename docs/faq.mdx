@@ -368,6 +368,22 @@ How much the cache quantization impacts the model's response quality will depend
 
 You may need to experiment with different quantization types to find the best balance between memory usage and quality.
 
+## How can I limit disk usage for evicted K/V cache?
+
+When the K/V cache exceeds the in-memory threshold, the oldest cached prefixes
+can be evicted to disk (under `<OLLAMA_MODELS>/../cache/kv/<digest>/`) so they
+can be restored on subsequent requests without recomputation. This avoids
+re-running prompt prefill for recurring conversation prefixes across restarts.
+
+- `OLLAMA_KV_CACHE_DISK_MAX` - Maximum disk usage (bytes) for evicted K/V cache
+  entries per model. Default is `0` (unlimited). When exceeded, the oldest
+  cache files are deleted.
+
+<Note>
+  Disk-backed K/V cache is currently implemented for the MLX runner
+  (Apple Silicon). Other runners ignore this variable.
+</Note>
+
 ## Where can I find my Ollama Public Key?
 
 Your **Ollama Public Key** is the public part of the key pair that lets your local Ollama instance talk to [ollama.com](https://ollama.com).
