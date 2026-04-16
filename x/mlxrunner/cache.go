@@ -18,6 +18,7 @@ package mlxrunner
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -582,6 +583,9 @@ func (c *kvCache) evictNode(node *trieNode) {
 }
 
 func (c *kvCache) dumpTree() {
+	if !slog.Default().Enabled(context.TODO(), logutil.LevelTrace) {
+		return
+	}
 	snap := c.buildTrieSnapshot()
 	for _, line := range strings.Split(renderTrieText(snap), "\n") {
 		if line != "" {

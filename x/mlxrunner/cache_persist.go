@@ -516,6 +516,25 @@ func snapshotTypes(snapshots []cache.Snapshot) []cache.SnapshotType {
 	return types
 }
 
+// isNodeCacheFile reports whether name matches the content-addressed filename
+// format produced by nodeFileHash: 16 lowercase hex chars + ".safetensors".
+// Scoping cleanup to this pattern avoids deleting unrelated files a user may
+// have placed in the cache directory.
+func isNodeCacheFile(name string) bool {
+	const suffix = ".safetensors"
+	const hashLen = 16
+	if len(name) != hashLen+len(suffix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	for i := 0; i < hashLen; i++ {
+		c := name[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -523,7 +542,7 @@ func cleanUnreferencedFiles(dir string, referenced map[string]bool) {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasSuffix(name, ".safetensors") && !referenced[name] {
+		if isNodeCacheFile(name) && !referenced[name] {
 			os.Remove(filepath.Join(dir, name))
 		}
 	}
