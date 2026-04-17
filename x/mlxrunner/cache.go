@@ -439,11 +439,35 @@ func (c *kvCache) advancePath(frontier *trieNode, tokens []int32, endOffset int)
 		lastNode := matchPath[len(matchPath)-1]
 		matchedInEdge := frontier.endOffset + matched - lastNode.startOffset()
 		if matchedInEdge > 0 && matchedInEdge < len(lastNode.tokens) {
-			intermediate := splitNode(lastNode, matchedInEdge, c.caches, &c.pagedOutBytes)
-			matchPath[len(matchPath)-1] = intermediate
-			// The new prefix carries snapshots; persist it so a future cache hit
-			// landing on the split point can reload from disk.
-			c.scheduleWrite(intermediate)
+			// A Cold node (snapshots dropped but disk file kept) cannot be
+			// split directly: splitNode only splits via Cache.Split when the
+			// source has in-memory snapshots. Without this load, the new
+			// parent is born with snapshots=nil and diskPath=="" (Gone), and
+			// the original's old disk file — which covers the full pre-split
+			// edge — becomes silently stale for the sliced suffix.
+			//
+			// Load the Cold node back into memory so Cache.Split has something
+			// to work with. On load failure, skip the split entirely by
+			// rolling the match back to the boundary BEFORE lastNode; the
+			// remaining tokens then fall through to appendTokens, which
+			// creates a sibling as the divergence point. No Gone intermediate
+			// is produced.
+			if c.writer != nil && lastNode.snapshots == nil && lastNode.diskPath != "" {
+				if err := c.loadFromDisk(lastNode); err != nil {
+					slog.Warn("kv cache: load-before-split failed, skipping split",
+						"path", lastNode.diskPath, "err", err)
+					atomic.AddInt64(&c.diskBytes, -lastNode.diskSize)
+					lastNode.diskPath = ""
+					lastNode.diskSize = 0
+					matched -= matchedInEdge
+					matchPath = matchPath[:len(matchPath)-1]
+					remaining = tokens[matched:]
+				} else {
+					c.splitAndPersist(matchPath, lastNode, matchedInEdge)
+				}
+			} else {
+				c.splitAndPersist(matchPath, lastNode, matchedInEdge)
+			}
 		}
 	}
 
@@ -464,6 +488,29 @@ func (c *kvCache) advancePath(frontier *trieNode, tokens []int32, endOffset int)
 		dest = newDest
 	}
 	return dest
+}
+
+// splitAndPersist runs splitNode on lastNode and persists both halves.
+// After the split, lastNode owns only the suffix tokens, so any existing
+// disk file attached to it is stale — the file covers the full pre-split
+// edge. Remove that file and clear the node's disk pointers so the next
+// scheduleWrite call produces a fresh file whose header tokens match.
+func (c *kvCache) splitAndPersist(matchPath []*trieNode, lastNode *trieNode, matchedInEdge int) {
+	if lastNode.diskPath != "" {
+		if err := os.Remove(lastNode.diskPath); err != nil && !os.IsNotExist(err) {
+			slog.Warn("kv cache: remove stale pre-split file",
+				"path", lastNode.diskPath, "err", err)
+		}
+		atomic.AddInt64(&c.diskBytes, -lastNode.diskSize)
+		lastNode.diskPath = ""
+		lastNode.diskSize = 0
+	}
+	intermediate := splitNode(lastNode, matchedInEdge, c.caches, &c.pagedOutBytes)
+	matchPath[len(matchPath)-1] = intermediate
+	// Persist both halves; their token ranges are now correct for their
+	// respective new files.
+	c.scheduleWrite(intermediate)
+	c.scheduleWrite(lastNode)
 }
 
 // attachSnapshots attaches cache snapshots to a trie node at the given offset.
@@ -761,6 +808,14 @@ func matchedAfterRestore(path []*trieNode, inputs []int32) int {
 func (c *kvCache) scheduleWrite(node *trieNode) {
 	if c.writer == nil {
 		return // feature disabled
+	}
+	if len(node.snapshots) == 0 {
+		// Nothing to serialize. This can happen briefly when a Cold node is
+		// split mid-eviction; the caller is expected to repopulate snapshots
+		// (via loadFromDisk or Cache.Split) before trying again.
+		slog.Debug("kv cache scheduleWrite skipped: no snapshots",
+			"start_offset", node.startOffset(), "tokens", len(node.tokens))
+		return
 	}
 	if node.diskPath != "" {
 		slog.Debug("kv cache scheduleWrite skipped: already on disk",

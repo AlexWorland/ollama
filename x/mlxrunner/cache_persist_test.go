@@ -583,3 +583,146 @@ func TestEndToEndWarmRestart(t *testing.T) {
 		t.Error("restore didn't materialize snapshots")
 	}
 }
+
+// newTestNode4D builds a trie node with a 4D [B,H,L,D] KV snapshot so that
+// real cache.KVCache.Split (which slices on axis 2) can operate on it.
+// Required by the split-on-Cold tests — the 2D helper above is incompatible
+// with KVCache.Split.
+func newTestNode4D(t *testing.T, parent *trieNode, tokens []int32, byteSize int) *trieNode {
+	t.Helper()
+	n := &trieNode{tokens: tokens, parent: parent, endOffset: parent.endOffset + len(tokens)}
+	parent.children = append(parent.children, n)
+	k := mlx.Zeros(mlx.DTypeFloat32, 1, 1, len(tokens), 8)
+	v := mlx.Zeros(mlx.DTypeFloat32, 1, 1, len(tokens), 8)
+	mlx.Pin(k, v)
+	n.snapshots = []cache.Snapshot{&arraySnapshot{keys: k, values: v, size: byteSize}}
+	return n
+}
+
+func TestSplitOfColdNodeLoadsBeforeSplit(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	// Real KVCache so Split has a working implementation.
+	c.caches[0] = cache.NewKVCache()
+	defer c.teardown()
+
+	// Persist a node with 5 tokens under the root.
+	node := newTestNode4D(t, c.root, []int32{10, 20, 30, 40, 50}, 1024)
+	c.scheduleWrite(node)
+	if node.diskPath == "" {
+		t.Fatal("node was not persisted")
+	}
+	oldPath := node.diskPath
+
+	// Demote to Cold: drop in-memory snapshots, keep diskPath.
+	for _, s := range node.snapshots {
+		s.Close()
+	}
+	node.snapshots = nil
+
+	// advancePath with tokens that partially match at index 3: [10,20,30] match,
+	// [99] diverges. This triggers splitNode on the Cold node.
+	c.activePath = []*trieNode{c.root}
+	_ = c.advancePath(c.root, []int32{10, 20, 30, 99}, 4)
+
+	// After the fix: the stale file is gone, original (now suffix) has tokens
+	// [40,50] with fresh snapshots and a new diskPath, and the new intermediate
+	// has tokens [10,20,30] with snapshots and diskPath.
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Errorf("stale pre-split file not removed: err=%v", err)
+	}
+	if len(node.tokens) != 2 || node.tokens[0] != 40 || node.tokens[1] != 50 {
+		t.Errorf("suffix tokens = %v, want [40,50]", node.tokens)
+	}
+	if node.snapshots == nil {
+		t.Error("suffix has no snapshots after split")
+	}
+	if node.diskPath == "" {
+		t.Error("suffix was not re-persisted")
+	}
+	if node.diskPath == oldPath {
+		t.Error("suffix kept stale diskPath")
+	}
+
+	if node.parent == nil || node.parent == c.root {
+		t.Fatalf("suffix parent wrong: %v", node.parent)
+	}
+	intermediate := node.parent
+	if len(intermediate.tokens) != 3 || intermediate.tokens[0] != 10 {
+		t.Errorf("prefix tokens = %v, want [10,20,30]", intermediate.tokens)
+	}
+	if intermediate.snapshots == nil {
+		t.Error("prefix has no snapshots after split")
+	}
+	if intermediate.diskPath == "" {
+		t.Error("prefix was not persisted")
+	}
+}
+
+func TestSplitOfColdNodeSkipsWhenLoadFails(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	c.caches[0] = cache.NewKVCache()
+	defer c.teardown()
+
+	node := newTestNode4D(t, c.root, []int32{10, 20, 30, 40, 50}, 1024)
+	c.scheduleWrite(node)
+	if node.diskPath == "" {
+		t.Fatal("node was not persisted")
+	}
+	oldPath := node.diskPath
+	oldSize := node.diskSize
+
+	// Demote to Cold and corrupt the file so loadFromDisk fails.
+	for _, s := range node.snapshots {
+		s.Close()
+	}
+	node.snapshots = nil
+	if err := os.Truncate(oldPath, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	before := atomic.LoadInt64(&c.diskBytes)
+	c.activePath = []*trieNode{c.root}
+	_ = c.advancePath(c.root, []int32{10, 20, 30, 99}, 4)
+
+	// Load failed: node should be demoted to Gone (diskPath cleared), no
+	// intermediate created, diskBytes decremented by the failed node's size.
+	if node.diskPath != "" {
+		t.Errorf("failed-load node still has diskPath = %q", node.diskPath)
+	}
+	if node.diskSize != 0 {
+		t.Errorf("failed-load node still has diskSize = %d", node.diskSize)
+	}
+	after := atomic.LoadInt64(&c.diskBytes)
+	if before-after != oldSize {
+		t.Errorf("diskBytes decrement = %d, want %d", before-after, oldSize)
+	}
+	// node.tokens must NOT have been sliced (no split happened).
+	if len(node.tokens) != 5 {
+		t.Errorf("node.tokens = %v, want 5 tokens (unsliced)", node.tokens)
+	}
+	// appendTokens should have created a sibling of node with the divergent tokens.
+	if len(c.root.children) < 2 {
+		t.Errorf("no sibling created for divergent tokens; root children=%d", len(c.root.children))
+	}
+}
+
+func TestScheduleWriteSkipsEmptySnapshots(t *testing.T) {
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = &diskWriter{}
+	defer c.teardown()
+
+	// Node with no snapshots — scheduleWrite should no-op without panic and
+	// without going through writeOne (which would warn).
+	n := &trieNode{tokens: []int32{1, 2, 3}, parent: c.root}
+	c.scheduleWrite(n)
+	if n.diskPath != "" {
+		t.Errorf("scheduleWrite on empty-snapshots node wrote to disk: %q", n.diskPath)
+	}
+}
