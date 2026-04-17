@@ -100,6 +100,17 @@ func (c *kvCache) begin(m base.Model, inputs []int32) *cacheSession {
 	matchPath, matched := findBestMatch(c.root, inputs)
 	originalMatched := matched
 
+	// Restore any Cold nodes on the match path before paging in. Failure
+	// demotes the failing node to Gone; recompute the matched length to
+	// reflect that the effective prefix may have shrunk.
+	if c.writer != nil {
+		_ = c.restoreMatchedPath(matchPath)
+		matched = matchedAfterRestore(matchPath, inputs)
+		if originalMatched != matched {
+			slog.Debug("kv cache restore truncated match", "from", originalMatched, "to", matched)
+		}
+	}
+
 	// Always keep at least one token to re-evaluate so the
 	// pipeline can seed token generation from it.
 	if matched == len(inputs) && matched > 0 {
@@ -503,6 +514,56 @@ func (c *kvCache) enforceEvictionPolicy() {
 		}
 		c.evictNode(best)
 	}
+}
+
+// restoreMatchedPath walks `path` from root side and restores any Cold nodes
+// (snapshots == nil but diskPath set) to Warm before the caller hands off to
+// switchToPath. A Gone node (diskPath empty, snapshots nil) or a load failure
+// stops the walk; the caller must handle a partial path by re-prefilling
+// the tail. Always returns nil today (errors are logged + degraded), but the
+// signature returns an error to leave room for future fail-loud modes.
+func (c *kvCache) restoreMatchedPath(path []*trieNode) error {
+	for _, node := range path {
+		if node == c.root {
+			continue
+		}
+		if node.snapshots != nil {
+			continue // Warm or just-restored
+		}
+		if node.diskPath == "" {
+			break // Gone: cannot restore from here
+		}
+		if err := c.loadFromDisk(node); err != nil {
+			slog.Warn("kv cache restore failed, treating as Gone",
+				"path", node.diskPath, "err", err)
+			node.diskPath = ""
+			node.diskSize = 0
+			break
+		}
+	}
+	return nil
+}
+
+// matchedAfterRestore recomputes the number of matching tokens after a
+// partial-restore walk that may have demoted some nodes to Gone. We stop
+// counting at the first node whose snapshots are still nil and whose
+// diskPath is empty — restore failed there.
+func matchedAfterRestore(path []*trieNode, inputs []int32) int {
+	matched := 0
+	for i, node := range path {
+		// Skip the root which has no tokens.
+		if i == 0 && node.parent == nil {
+			continue
+		}
+		if node.snapshots == nil && node.diskPath == "" {
+			return matched
+		}
+		matched += len(node.tokens)
+		if matched > len(inputs) {
+			return len(inputs)
+		}
+	}
+	return matched
 }
 
 // scheduleWrite enqueues node for disk write if persistence is enabled

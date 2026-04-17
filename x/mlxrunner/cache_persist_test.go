@@ -359,3 +359,57 @@ func TestLoadFromDiskRejectsForeignDigest(t *testing.T) {
 		t.Error("loadFromDisk should reject cross-model files")
 	}
 }
+
+func TestRestoreMatchedPathRestoresCold(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3}, 1024)
+	c.scheduleWrite(node)
+	<-node.inflightWrite
+	for _, s := range node.snapshots {
+		s.Close()
+	}
+	node.snapshots = nil
+
+	if err := c.restoreMatchedPath([]*trieNode{node}); err != nil {
+		t.Fatalf("restoreMatchedPath: %v", err)
+	}
+	if len(node.snapshots) != 1 {
+		t.Errorf("restoreMatchedPath didn't restore snapshots (got %d)", len(node.snapshots))
+	}
+}
+
+func TestRestoreMatchedPathStopsOnGoneAncestor(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
+	c.scheduleWrite(n1)
+	<-n1.inflightWrite
+	for _, s := range n1.snapshots {
+		s.Close()
+	}
+	n1.snapshots = nil
+
+	// n2 is Gone (no diskPath, no snapshots).
+	n2 := &trieNode{tokens: []int32{2}, parent: n1, endOffset: n1.endOffset + 1}
+	n1.children = append(n1.children, n2)
+
+	err := c.restoreMatchedPath([]*trieNode{n1, n2})
+	if err != nil {
+		t.Errorf("restoreMatchedPath returned error on Gone ancestor (should degrade): %v", err)
+	}
+	if n1.snapshots == nil {
+		t.Error("n1 should have been restored before the loop stopped at n2")
+	}
+	if n2.snapshots != nil {
+		t.Error("n2 should remain unrestored (it was Gone)")
+	}
+}
