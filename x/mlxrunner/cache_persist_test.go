@@ -413,3 +413,71 @@ func TestRestoreMatchedPathStopsOnGoneAncestor(t *testing.T) {
 		t.Error("n2 should remain unrestored (it was Gone)")
 	}
 }
+
+func TestMemoryPassDemotesToCold(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2}, 9<<30) // oversized
+	c.pagedOutBytes = 9 << 30
+	c.scheduleWrite(node)
+	<-node.inflightWrite
+
+	c.enforceEvictionPolicy()
+	if node.snapshots != nil {
+		t.Error("memory pass should have dropped snapshots")
+	}
+	if node.diskPath == "" {
+		t.Error("disk file was deleted in memory pass — should only drop memory")
+	}
+}
+
+func TestMemoryPassSkipsInflightWrites(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 9<<30)
+	c.pagedOutBytes = 9 << 30
+	node.inflightWrite = make(chan struct{})
+
+	c.enforceEvictionPolicy()
+	if node.snapshots == nil {
+		t.Error("memory pass dropped a node whose write was still in flight")
+	}
+	close(node.inflightWrite)
+	node.inflightWrite = nil
+}
+
+func TestDiskPassRemovesOverCap(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	c.diskMax = 100 // very small cap
+	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
+	n2 := newTestNodeWithArraySnapshot(t, c.root, []int32{2}, 1024)
+	c.scheduleWrite(n1)
+	<-n1.inflightWrite
+	c.scheduleWrite(n2)
+	<-n2.inflightWrite
+
+	// Make n1 older so disk pass picks it first.
+	n1.lastUsed = n1.lastUsed.Add(-time.Hour)
+
+	c.enforceEvictionPolicy()
+
+	if _, err := os.Stat(n1.diskPath); !os.IsNotExist(err) {
+		t.Errorf("disk pass did not delete oldest node's file (err=%v)", err)
+	}
+	if _, err := os.Stat(n2.diskPath); err != nil {
+		t.Errorf("disk pass deleted too much: %v", err)
+	}
+}

@@ -20,7 +20,9 @@ import (
 	"cmp"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/ollama/ollama/logutil"
@@ -482,37 +484,101 @@ func (s *cacheSession) close() {
 	}
 }
 
-// enforceEvictionPolicy evicts eligible nodes until paged-out memory is within limits.
+// enforceEvictionPolicy runs the two-tier eviction:
+//   - Memory pass: demote Warm nodes to Cold (drop snapshots, keep disk file).
+//   - Disk pass: delete files (and trie nodes) once diskBytes > diskMax.
+//
+// When persistence is disabled (writer == nil) the memory pass falls back to
+// the legacy delete behavior — byte-for-byte identical to upstream main.
 func (c *kvCache) enforceEvictionPolicy() {
-	if c.pagedOutBytes <= maxPagedOutBytes {
-		return
-	}
+	c.enforceMemoryPolicy()
+	c.enforceDiskPolicy()
+}
 
+// selectEvictionCandidate runs the existing selector rule (oldest lastUsed,
+// then deepest endOffset, then largest snapshotBytes) over nodes that satisfy
+// the supplied filter, skipping root / activePath / multi-child branch points.
+func (c *kvCache) selectEvictionCandidate(filter func(*trieNode) bool) *trieNode {
 	activeSet := make(map[*trieNode]bool, len(c.activePath))
 	for _, n := range c.activePath {
 		activeSet[n] = true
 	}
-
-	for c.pagedOutBytes > maxPagedOutBytes {
-		var best *trieNode
-		walkNodes(c.root, func(n *trieNode) bool {
-			if n == c.root || activeSet[n] || len(n.children) > 1 {
-				return true
-			}
-			// Evict: oldest, then deepest, then largest.
-			if best == nil || cmp.Or(
-				n.lastUsed.Compare(best.lastUsed),
-				cmp.Compare(best.endOffset, n.endOffset),
-				cmp.Compare(best.snapshotBytes(), n.snapshotBytes()),
-			) < 0 {
-				best = n
-			}
+	var best *trieNode
+	walkNodes(c.root, func(n *trieNode) bool {
+		if n == c.root || activeSet[n] || len(n.children) > 1 {
 			return true
-		})
-		if best == nil {
-			break
 		}
-		c.evictNode(best)
+		if !filter(n) {
+			return true
+		}
+		if best == nil || cmp.Or(
+			n.lastUsed.Compare(best.lastUsed),
+			cmp.Compare(best.endOffset, n.endOffset),
+			cmp.Compare(best.snapshotBytes(), n.snapshotBytes()),
+		) < 0 {
+			best = n
+		}
+		return true
+	})
+	return best
+}
+
+func (c *kvCache) enforceMemoryPolicy() {
+	for c.pagedOutBytes > maxPagedOutBytes {
+		cand := c.selectEvictionCandidate(func(n *trieNode) bool {
+			return n.snapshots != nil
+		})
+		if cand == nil {
+			return
+		}
+		if cand.inflightWrite != nil {
+			// Cannot drop safely while a write is in flight; bail this cycle.
+			return
+		}
+		if cand.diskPath == "" {
+			// Not yet on disk. If persistence is enabled and we haven't burned
+			// the retry budget, schedule a write and let the next cycle retry.
+			if c.writer != nil && cand.writeAttempts < 3 {
+				c.scheduleWrite(cand)
+				return
+			}
+			// Permanently un-persisted (feature off, or 3+ failures): legacy delete.
+			c.evictNode(cand)
+			continue
+		}
+		// Warm -> Cold: drop in-memory snapshots, keep trie node + disk file.
+		freed := cand.snapshotBytes()
+		for _, s := range cand.snapshots {
+			if s != nil {
+				s.Close()
+			}
+		}
+		cand.snapshots = nil
+		c.pagedOutBytes -= freed
+	}
+}
+
+func (c *kvCache) enforceDiskPolicy() {
+	if c.writer == nil || c.diskMax <= 0 {
+		return
+	}
+	for atomic.LoadInt64(&c.diskBytes) > c.diskMax {
+		cand := c.selectEvictionCandidate(func(n *trieNode) bool {
+			return n.diskPath != ""
+		})
+		if cand == nil {
+			return
+		}
+		if err := os.Remove(cand.diskPath); err != nil && !os.IsNotExist(err) {
+			slog.Warn("kv cache disk evict: remove failed", "path", cand.diskPath, "err", err)
+		}
+		atomic.AddInt64(&c.diskBytes, -cand.diskSize)
+		cand.diskPath = ""
+		cand.diskSize = 0
+		// Removes the node from the trie. evictNode handles both leaves and
+		// single-child interior nodes; multi-child nodes were filtered out
+		// by the selector.
+		c.evictNode(cand)
 	}
 }
 
