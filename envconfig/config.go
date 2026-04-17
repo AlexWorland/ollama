@@ -296,6 +296,81 @@ func Uint64(key string, defaultValue uint64) func() uint64 {
 // Set aside VRAM per GPU
 var GpuOverhead = Uint64("OLLAMA_GPU_OVERHEAD", 0)
 
+// parseByteSize parses an integer byte size with an optional binary/decimal suffix.
+// Convention: bare letter (K, M, G, T) and "iB" suffix (KiB, MiB, GiB, TiB) are
+// binary (powers of 2). "B" suffix (KB, MB, GB, TB) is decimal (powers of 10).
+// A bare integer (including 0 and negatives) is returned as-is.
+// Fractional values are not supported.
+func parseByteSize(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
+	}
+	i := 0
+	if s[0] == '-' || s[0] == '+' {
+		i = 1
+	}
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 || (i == 1 && (s[0] == '-' || s[0] == '+')) {
+		return 0, fmt.Errorf("no digits: %q", s)
+	}
+	n, err := strconv.ParseInt(s[:i], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	var mult int64
+	switch strings.ToUpper(s[i:]) {
+	case "K", "KIB":
+		mult = 1 << 10
+	case "KB":
+		mult = 1000
+	case "M", "MIB":
+		mult = 1 << 20
+	case "MB":
+		mult = 1000 * 1000
+	case "G", "GIB":
+		mult = 1 << 30
+	case "GB":
+		mult = 1000 * 1000 * 1000
+	case "T", "TIB":
+		mult = 1 << 40
+	case "TB":
+		mult = 1000 * 1000 * 1000 * 1000
+	default:
+		return 0, fmt.Errorf("unknown suffix %q", s[i:])
+	}
+	return n * mult, nil
+}
+
+// KVCacheDiskMax returns the maximum total bytes allowed for on-disk KV cache snapshots.
+// Negative or unset: unlimited (default). Zero: persistence disabled. Positive: hard cap.
+// Accepts byte-unit suffixes (e.g. "50GiB"). Invalid values log a warning and return the default.
+func KVCacheDiskMax() int64 {
+	if s := Var("OLLAMA_KV_CACHE_DISK_MAX"); s != "" {
+		n, err := parseByteSize(s)
+		if err != nil {
+			slog.Warn("invalid OLLAMA_KV_CACHE_DISK_MAX, using default", "value", s, "err", err)
+			return -1
+		}
+		return n
+	}
+	return -1
+}
+
+// KVCacheRoot returns the root directory for on-disk KV cache snapshots.
+// One subdirectory per model digest is created underneath.
+// Default: <OLLAMA_MODELS dir>/../cache/kv, i.e. sibling to the models store.
+func KVCacheRoot() string {
+	if s := Var("OLLAMA_KV_CACHE_ROOT"); s != "" {
+		return s
+	}
+	return filepath.Join(filepath.Dir(Models()), "cache", "kv")
+}
+
 type EnvVar struct {
 	Name        string
 	Value       any
@@ -309,6 +384,8 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_FLASH_ATTENTION":    {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":      {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
 		"OLLAMA_GPU_OVERHEAD":       {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
+		"OLLAMA_KV_CACHE_DISK_MAX":  {"OLLAMA_KV_CACHE_DISK_MAX", KVCacheDiskMax(), "Max bytes of on-disk MLX KV cache (-1 or unset = unlimited, 0 = disabled). Suffixes: KiB, MiB, GiB, KB, MB, GB."},
+		"OLLAMA_KV_CACHE_ROOT":      {"OLLAMA_KV_CACHE_ROOT", KVCacheRoot(), "Root directory for on-disk MLX KV cache (default: sibling of models dir)."},
 		"OLLAMA_HOST":               {"OLLAMA_HOST", Host(), "IP Address for the ollama server (default 127.0.0.1:11434)"},
 		"OLLAMA_KEEP_ALIVE":         {"OLLAMA_KEEP_ALIVE", KeepAlive(), "The duration that models stay loaded in memory (default \"5m\")"},
 		"OLLAMA_LLM_LIBRARY":        {"OLLAMA_LLM_LIBRARY", LLMLibrary(), "Set LLM library to bypass autodetection"},
