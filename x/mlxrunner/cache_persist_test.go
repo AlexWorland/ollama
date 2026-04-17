@@ -176,7 +176,28 @@ func TestWriteOneRoundTrip(t *testing.T) {
 	}
 }
 
-func TestDiskWriterFIFO(t *testing.T) {
+func TestScheduleWriteSynchronous(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{7, 7, 7}, 1024)
+	c.scheduleWrite(node)
+	// Synchronous write: scheduleWrite returns only after the file is on disk.
+	if node.diskPath == "" {
+		t.Errorf("node.diskPath empty after scheduleWrite")
+	}
+	if _, err := os.Stat(node.diskPath); err != nil {
+		t.Errorf("file missing after scheduleWrite: %v", err)
+	}
+	if atomic.LoadInt64(&c.diskBytes) <= 0 {
+		t.Error("diskBytes not updated")
+	}
+}
+
+func TestScheduleWriteManyNodes(t *testing.T) {
 	skipIfNoMLX(t)
 	dir := t.TempDir()
 	c := newTestKvCacheWithDisk(t, dir, "model", 1)
@@ -187,17 +208,9 @@ func TestDiskWriterFIFO(t *testing.T) {
 	nodes := make([]*trieNode, N)
 	for i := range nodes {
 		nodes[i] = newTestNodeWithArraySnapshot(t, c.root, []int32{int32(i)}, 1024)
-		nodes[i].inflightWrite = make(chan struct{})
-		c.writer.enqueue(nodes[i])
-	}
-	for i, n := range nodes {
-		select {
-		case <-n.inflightWrite:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("node[%d] write did not complete in 5s", i)
-		}
-		if n.diskPath == "" {
-			t.Errorf("node[%d].diskPath empty after write", i)
+		c.scheduleWrite(nodes[i])
+		if nodes[i].diskPath == "" {
+			t.Errorf("node[%d] not persisted", i)
 		}
 	}
 	if atomic.LoadInt64(&c.diskBytes) <= 0 {
@@ -205,73 +218,30 @@ func TestDiskWriterFIFO(t *testing.T) {
 	}
 }
 
-func TestDiskWriterShutdownDrainsQueue(t *testing.T) {
-	skipIfNoMLX(t)
-	dir := t.TempDir()
-	c := newTestKvCacheWithDisk(t, dir, "model", 1)
-	c.writer = newDiskWriter(c.kvCache)
-
-	nodes := make([]*trieNode, 3)
-	for i := range nodes {
-		nodes[i] = newTestNodeWithArraySnapshot(t, c.root, []int32{int32(i)}, 1024)
-		nodes[i].inflightWrite = make(chan struct{})
-		c.writer.enqueue(nodes[i])
-	}
-	remaining := c.writer.shutdown(5 * time.Second)
-	if remaining != 0 {
-		t.Errorf("shutdown left %d pending", remaining)
-	}
-	for i, n := range nodes {
-		if n.diskPath == "" {
-			t.Errorf("node[%d] not persisted after shutdown drain", i)
-		}
-	}
-}
-
-func TestDiskWriterShutdownTimeoutReportsRemaining(t *testing.T) {
-	skipIfNoMLX(t)
-	dir := t.TempDir()
-	c := newTestKvCacheWithDisk(t, dir, "model", 1)
-	c.writer = newDiskWriter(c.kvCache)
-
-	// Force write errors via a read-only directory so the writer keeps
-	// failing and shutdown(timeout) exercises the not-yet-drained branch.
-	readOnly := filepath.Join(dir, "ro")
-	if err := os.MkdirAll(readOnly, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	c.cacheDir = readOnly
-
-	for i := 0; i < 2; i++ {
-		n := newTestNodeWithArraySnapshot(t, c.root, []int32{int32(i)}, 1024)
-		n.inflightWrite = make(chan struct{})
-		c.writer.enqueue(n)
-	}
-	// Test only asserts shutdown returns within reasonable time; remaining
-	// count may vary depending on how fast the loop drained before stop.
-	_ = c.writer.shutdown(2 * time.Second)
-}
-
-func TestAttachSnapshotsSchedulesWrite(t *testing.T) {
+func TestScheduleWriteCircuitBreaker(t *testing.T) {
 	skipIfNoMLX(t)
 	dir := t.TempDir()
 	c := newTestKvCacheWithDisk(t, dir, "model", 1)
 	c.writer = newDiskWriter(c.kvCache)
 	defer c.teardown()
 
-	node := newTestNodeWithArraySnapshot(t, c.root, []int32{7, 7, 7}, 1024)
-	c.scheduleWrite(node)
+	// Force write errors via a read-only directory. After 5 consecutive
+	// failures the circuit breaker should trip and disable the writer.
+	readOnly := filepath.Join(dir, "ro")
+	if err := os.MkdirAll(readOnly, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	c.cacheDir = readOnly
 
-	if node.inflightWrite == nil {
-		t.Fatal("scheduleWrite did not create an inflightWrite channel")
+	for i := 0; i < 6; i++ {
+		n := newTestNodeWithArraySnapshot(t, c.root, []int32{int32(i)}, 1024)
+		c.scheduleWrite(n)
 	}
-	select {
-	case <-node.inflightWrite:
-	case <-time.After(2 * time.Second):
-		t.Fatal("write did not complete within 2s")
-	}
-	if node.diskPath == "" {
-		t.Errorf("node.diskPath still empty after write")
+	c.writer.mu.Lock()
+	disabled := c.writer.disabled
+	c.writer.mu.Unlock()
+	if !disabled {
+		t.Error("circuit breaker did not trip after 6 failed writes")
 	}
 }
 
@@ -284,20 +254,19 @@ func TestScheduleWriteIdempotent(t *testing.T) {
 
 	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
 	c.scheduleWrite(node)
-	ch1 := node.inflightWrite
-	c.scheduleWrite(node)
-	if node.inflightWrite != ch1 {
-		t.Error("second scheduleWrite replaced the in-flight channel")
+	path := node.diskPath
+	stat1, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("file missing after first scheduleWrite: %v", err)
 	}
-	<-ch1
-
-	// After write completes, another scheduleWrite is still a no-op because
-	// diskPath is now set. The channel field itself stays non-nil (closed);
-	// the test asserts no NEW channel was allocated.
-	before := node.inflightWrite
+	// Second call should be a no-op — the node is already persisted.
 	c.scheduleWrite(node)
-	if node.inflightWrite != before {
-		t.Error("scheduleWrite re-enqueued an already-persisted node")
+	stat2, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("file missing after second scheduleWrite: %v", err)
+	}
+	if !stat1.ModTime().Equal(stat2.ModTime()) {
+		t.Error("second scheduleWrite re-wrote the file")
 	}
 }
 
@@ -307,8 +276,8 @@ func TestScheduleWriteNoOpWhenWriterNil(t *testing.T) {
 	node := &trieNode{tokens: []int32{1}, parent: c.root}
 	c.root.children = append(c.root.children, node)
 	c.scheduleWrite(node) // must not panic
-	if node.inflightWrite != nil {
-		t.Error("scheduleWrite created channel even though writer is nil")
+	if node.diskPath != "" {
+		t.Error("scheduleWrite wrote even though writer is nil")
 	}
 }
 
@@ -321,7 +290,6 @@ func TestLoadFromDisk(t *testing.T) {
 
 	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3}, 1024)
 	c.scheduleWrite(node)
-	<-node.inflightWrite
 	path := node.diskPath
 	size := node.diskSize
 
@@ -351,7 +319,6 @@ func TestLoadFromDiskRejectsForeignDigest(t *testing.T) {
 
 	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
 	c.scheduleWrite(node)
-	<-node.inflightWrite
 	path := node.diskPath
 	node.snapshots = nil
 
@@ -372,7 +339,6 @@ func TestRestoreMatchedPathRestoresCold(t *testing.T) {
 
 	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3}, 1024)
 	c.scheduleWrite(node)
-	<-node.inflightWrite
 	for _, s := range node.snapshots {
 		s.Close()
 	}
@@ -395,7 +361,6 @@ func TestRestoreMatchedPathStopsOnGoneAncestor(t *testing.T) {
 
 	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
 	c.scheduleWrite(n1)
-	<-n1.inflightWrite
 	for _, s := range n1.snapshots {
 		s.Close()
 	}
@@ -427,7 +392,6 @@ func TestMemoryPassDemotesToCold(t *testing.T) {
 	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2}, 9<<30) // oversized
 	c.pagedOutBytes = 9 << 30
 	c.scheduleWrite(node)
-	<-node.inflightWrite
 
 	c.enforceEvictionPolicy()
 	if node.snapshots != nil {
@@ -436,25 +400,6 @@ func TestMemoryPassDemotesToCold(t *testing.T) {
 	if node.diskPath == "" {
 		t.Error("disk file was deleted in memory pass — should only drop memory")
 	}
-}
-
-func TestMemoryPassSkipsInflightWrites(t *testing.T) {
-	skipIfNoMLX(t)
-	dir := t.TempDir()
-	c := newTestKvCacheWithDisk(t, dir, "model", 1)
-	c.writer = newDiskWriter(c.kvCache)
-	defer c.teardown()
-
-	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 9<<30)
-	c.pagedOutBytes = 9 << 30
-	node.inflightWrite = make(chan struct{})
-
-	c.enforceEvictionPolicy()
-	if node.snapshots == nil {
-		t.Error("memory pass dropped a node whose write was still in flight")
-	}
-	close(node.inflightWrite)
-	node.inflightWrite = nil
 }
 
 func TestDiskPassRemovesOverCap(t *testing.T) {
@@ -467,9 +412,7 @@ func TestDiskPassRemovesOverCap(t *testing.T) {
 	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
 	n2 := newTestNodeWithArraySnapshot(t, c.root, []int32{2}, 1024)
 	c.scheduleWrite(n1)
-	<-n1.inflightWrite
 	c.scheduleWrite(n2)
-	<-n2.inflightWrite
 	// Set the cap so it holds exactly one file's worth plus slack. The
 	// on-disk safetensors size for two 1x8 float32 arrays + metadata is
 	// runtime-dependent, so base the cap on actual diskSize.
@@ -513,10 +456,8 @@ func TestRehydrateRebuildsSkeleton(t *testing.T) {
 	sessA.writer = newDiskWriter(sessA.kvCache)
 	n1 := newTestNodeWithArraySnapshot(t, sessA.root, []int32{1, 2}, 1024)
 	sessA.scheduleWrite(n1)
-	<-n1.inflightWrite
 	n2 := newTestNodeWithArraySnapshot(t, n1, []int32{3, 4}, 1024)
 	sessA.scheduleWrite(n2)
-	<-n2.inflightWrite
 	sessA.teardown()
 
 	// Session B: fresh cache, same dir, same model.
@@ -573,7 +514,6 @@ func TestRehydrateRejectsForeignDigest(t *testing.T) {
 	sessA.writer = newDiskWriter(sessA.kvCache)
 	n := newTestNodeWithArraySnapshot(t, sessA.root, []int32{1}, 1024)
 	sessA.scheduleWrite(n)
-	<-n.inflightWrite
 	sessA.teardown()
 
 	sessB := newTestKvCacheWithDisk(t, dir, "modelB", 1) // different digest
@@ -622,7 +562,6 @@ func TestEndToEndWarmRestart(t *testing.T) {
 	// helper attaches a real array snapshot under the runtime root.
 	node := newTestNodeWithArraySnapshot(t, sessA.root, []int32{1, 2, 3, 4}, 1024)
 	sessA.scheduleWrite(node)
-	<-node.inflightWrite
 	sessA.shutdown()
 
 	// Session B: fresh cache, same env, should rehydrate.

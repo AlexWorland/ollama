@@ -603,11 +603,10 @@ func (c *kvCache) enforceMemoryPolicy() {
 		if cand == nil {
 			break
 		}
-		if isWriteInFlight(cand.inflightWrite) {
-			slog.Debug("kv cache memory pass: candidate has in-flight write, deferring",
-				"start_offset", cand.startOffset())
-			return
-		}
+		// Note: synchronous writeNode means a write can never be "in flight"
+		// from the perspective of this pass — writes complete before the
+		// pipeline ever returns control. The check that used to live here
+		// (for the old async writer) is now unnecessary.
 		if cand.diskPath == "" {
 			if c.writer != nil && cand.writeAttempts < 3 {
 				slog.Debug("kv cache memory pass: scheduling write before evict",
@@ -750,20 +749,18 @@ func matchedAfterRestore(path []*trieNode, inputs []int32) int {
 	return matched
 }
 
-// scheduleWrite enqueues node for disk write if persistence is enabled
-// and the node isn't already written or in flight. Idempotent.
+// scheduleWrite writes node to disk synchronously (on the caller's
+// goroutine) if persistence is enabled and the node isn't already written.
+// Called from the pipeline goroutine only. MLX thread-safety: all MLX
+// work here runs on the same goroutine that performs inference, so the
+// Metal command stream stays single-owner.
 //
-// "In flight" means inflightWrite is non-nil AND not yet closed. Once the
-// writer closes the channel (see diskWriter.loop), the node is safe to
-// re-enqueue if needed (e.g., the write failed and a retry is warranted).
+// The 7-ish-millisecond stall per snapshot is negligible relative to
+// prefill time (snapshots land every ~8192 tokens, at GPU-throughput
+// speeds). See the diskWriter type comment for why this isn't async.
 func (c *kvCache) scheduleWrite(node *trieNode) {
 	if c.writer == nil {
 		return // feature disabled
-	}
-	if isWriteInFlight(node.inflightWrite) {
-		slog.Debug("kv cache scheduleWrite skipped: write in flight",
-			"start_offset", node.startOffset(), "tokens", len(node.tokens))
-		return
 	}
 	if node.diskPath != "" {
 		slog.Debug("kv cache scheduleWrite skipped: already on disk",
@@ -775,24 +772,7 @@ func (c *kvCache) scheduleWrite(node *trieNode) {
 			"start_offset", node.startOffset(), "attempts", node.writeAttempts)
 		return
 	}
-	node.inflightWrite = make(chan struct{})
-	c.writer.enqueue(node)
-}
-
-// isWriteInFlight returns true if ch represents a pending write: non-nil
-// and not yet closed. Calling code must only inspect node.inflightWrite
-// from the main goroutine; the writer goroutine only closes the channel,
-// never rewrites the field.
-func isWriteInFlight(ch chan struct{}) bool {
-	if ch == nil {
-		return false
-	}
-	select {
-	case <-ch:
-		return false // closed — write finished
-	default:
-		return true // still open — write queued or running
-	}
+	c.writer.writeNode(c, node)
 }
 
 // evictNode evicts a single node from the trie, freeing its snapshot memory.
