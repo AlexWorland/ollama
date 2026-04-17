@@ -600,3 +600,37 @@ func TestFeatureEnabledCreatesWriter(t *testing.T) {
 		t.Errorf("cacheDir = %q, want suffix modelX", c.cacheDir)
 	}
 }
+
+func TestEndToEndWarmRestart(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	t.Setenv("OLLAMA_KV_CACHE_ROOT", dir)
+	t.Setenv("OLLAMA_KV_CACHE_DISK_MAX", "-1")
+
+	// Session A: write a node, then drain & shutdown.
+	sessA := newKvCache("m", 1)
+	// helper attaches a real array snapshot under the runtime root.
+	node := newTestNodeWithArraySnapshot(t, sessA.root, []int32{1, 2, 3, 4}, 1024)
+	sessA.scheduleWrite(node)
+	<-node.inflightWrite
+	sessA.shutdown()
+
+	// Session B: fresh cache, same env, should rehydrate.
+	sessB := newKvCache("m", 1)
+	defer sessB.shutdown()
+	if len(sessB.root.children) != 1 {
+		t.Fatalf("rehydrate missed node (children=%d)", len(sessB.root.children))
+	}
+	rehydrated := sessB.root.children[0]
+	if rehydrated.snapshots != nil {
+		t.Error("rehydrated node not Cold")
+	}
+
+	// Simulate a prefix match and call restoreMatchedPath.
+	if err := sessB.restoreMatchedPath([]*trieNode{rehydrated}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if rehydrated.snapshots == nil {
+		t.Error("restore didn't materialize snapshots")
+	}
+}
