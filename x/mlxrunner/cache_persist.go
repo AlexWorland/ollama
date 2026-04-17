@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
@@ -369,5 +370,83 @@ func (c *kvCache) readHeader(path string) (headerFields, error) {
 		raw[k] = sf.GetMetadata(k)
 	}
 	return decodeHeader(raw)
+}
+
+// loadFromDisk reconstructs node.snapshots from node.diskPath and attaches them.
+// Precondition: node.diskPath != "" && node.snapshots == nil.
+// On error the node is unchanged (still Cold).
+func (c *kvCache) loadFromDisk(node *trieNode) error {
+	if node.diskPath == "" {
+		return errors.New("loadFromDisk: empty diskPath")
+	}
+	if node.snapshots != nil {
+		return errors.New("loadFromDisk: node already has snapshots")
+	}
+	sf, err := mlx.LoadSafetensorsNative(node.diskPath)
+	if err != nil {
+		return fmt.Errorf("load safetensors: %w", err)
+	}
+	raw := make(map[string]string)
+	for _, k := range []string{
+		"cache_format_version", "model_digest", "parent_hash",
+		"tokens", "layer_count", "snapshot_types",
+	} {
+		raw[k] = sf.GetMetadata(k)
+	}
+	h, err := decodeHeader(raw)
+	if err != nil {
+		sf.Free()
+		return err
+	}
+	if h.modelDigest != c.modelDigest {
+		sf.Free()
+		return fmt.Errorf("model_digest mismatch: file=%q cache=%q", h.modelDigest, c.modelDigest)
+	}
+	if h.layerCount != len(c.caches) {
+		sf.Free()
+		return fmt.Errorf("layer_count mismatch: file=%d cache=%d", h.layerCount, len(c.caches))
+	}
+
+	startOffset := node.startOffset()
+	endOffset := startOffset + len(h.tokens)
+	if node.endOffset > 0 {
+		// Trust the node's own endOffset when set (e.g., not from rehydration).
+		endOffset = node.endOffset
+	}
+	snaps, err := c.restoreSnapshotArrays(sf, h, startOffset, endOffset)
+	if err != nil {
+		sf.Free()
+		return err
+	}
+	node.setSnapshots(snaps, &c.pagedOutBytes)
+	node.lastUsed = time.Now()
+	sf.Free()
+	return nil
+}
+
+// restoreSnapshotArrays dispatches by snapshot_types metadata to rebuild
+// typed Snapshots from a loaded safetensors file. Unknown types are
+// treated as corrupt (per spec §10.3).
+func (c *kvCache) restoreSnapshotArrays(sf *mlx.SafetensorsFile, h headerFields, startOffset, endOffset int) ([]cache.Snapshot, error) {
+	snaps := make([]cache.Snapshot, h.layerCount)
+	for i := 0; i < h.layerCount; i++ {
+		st := "kv"
+		if i < len(h.snapshotTypes) {
+			st = h.snapshotTypes[i]
+		}
+		switch st {
+		case "kv":
+			k := sf.Get(fmt.Sprintf("layer_%d_keys", i))
+			v := sf.Get(fmt.Sprintf("layer_%d_values", i))
+			if k == nil || v == nil {
+				return nil, fmt.Errorf("layer %d: keys/values array missing", i)
+			}
+			mlx.Pin(k, v)
+			snaps[i] = cache.NewKVSnapshotFromArrays(k, v, startOffset, endOffset)
+		default:
+			return nil, fmt.Errorf("unknown snapshot type %q at layer %d", st, i)
+		}
+	}
+	return snaps, nil
 }
 

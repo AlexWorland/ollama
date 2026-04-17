@@ -308,3 +308,54 @@ func TestScheduleWriteNoOpWhenWriterNil(t *testing.T) {
 		t.Error("scheduleWrite created channel even though writer is nil")
 	}
 }
+
+func TestLoadFromDisk(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3}, 1024)
+	c.scheduleWrite(node)
+	<-node.inflightWrite
+	path := node.diskPath
+	size := node.diskSize
+
+	// Simulate Cold: drop snapshots in memory.
+	for _, s := range node.snapshots {
+		s.Close()
+	}
+	node.snapshots = nil
+
+	if err := c.loadFromDisk(node); err != nil {
+		t.Fatalf("loadFromDisk: %v", err)
+	}
+	if len(node.snapshots) != 1 {
+		t.Fatalf("after load: got %d snapshots, want 1", len(node.snapshots))
+	}
+	if node.diskPath != path || node.diskSize != size {
+		t.Errorf("load mutated disk fields: %q %d", node.diskPath, node.diskSize)
+	}
+}
+
+func TestLoadFromDiskRejectsForeignDigest(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "modelA", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
+	c.scheduleWrite(node)
+	<-node.inflightWrite
+	path := node.diskPath
+	node.snapshots = nil
+
+	c2 := newTestKvCacheWithDisk(t, dir, "modelB", 1) // different digest
+	defer c2.teardown()
+	foreignNode := &trieNode{diskPath: path, parent: c2.root}
+	if err := c2.loadFromDisk(foreignNode); err == nil {
+		t.Error("loadFromDisk should reject cross-model files")
+	}
+}

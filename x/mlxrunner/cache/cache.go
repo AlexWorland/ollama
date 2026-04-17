@@ -100,6 +100,24 @@ type kvSnapshot struct {
 func (s *kvSnapshot) Size() int { return s.keys.NumBytes() + s.values.NumBytes() }
 func (s *kvSnapshot) Close()    { mlx.Unpin(s.keys, s.values) }
 
+// Keys and Values expose the underlying mlx arrays for the persistence layer
+// (see x/mlxrunner/cache_persist.go). Callers must not mutate them.
+func (s *kvSnapshot) Keys() *mlx.Array   { return s.keys }
+func (s *kvSnapshot) Values() *mlx.Array { return s.values }
+
+// NewKVSnapshotFromArrays rebuilds a paged-out KV snapshot from externally-
+// produced arrays (e.g. loaded from a safetensors file). fromOffset and
+// toOffset are the absolute token range this snapshot covers. The returned
+// Snapshot owns the arrays and will Unpin them on Close.
+func NewKVSnapshotFromArrays(keys, values *mlx.Array, fromOffset, toOffset int) Snapshot {
+	return &kvSnapshot{
+		keys:       keys,
+		values:     values,
+		fromOffset: fromOffset,
+		toOffset:   toOffset,
+	}
+}
+
 func (c *KVCache) Snapshot(fromOffset int) Snapshot {
 	if c.keys == nil || c.offset <= fromOffset {
 		return nil
