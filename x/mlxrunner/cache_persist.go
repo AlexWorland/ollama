@@ -27,13 +27,21 @@ const cacheFormatVersion = "1"
 // diskWriter serializes trieNode writes to disk on a single goroutine.
 // Queue is a mutex-guarded slice (channels caused a shutdown deadlock in
 // the prior branch — see commit 4f6e3111 in the historical persist branch).
+//
+// stopped vs disabled:
+//   - stopped: shutdown was called. Reject new enqueues, drain pending
+//     queue WITH writes, exit loop when queue is empty.
+//   - disabled: circuit breaker tripped (5+ consecutive failures). Drain
+//     pending queue WITHOUT writes, then exit. Stays disabled for the
+//     lifetime of the writer.
 type diskWriter struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	pending []*trieNode
-	stopped bool
-	done    chan struct{}
-	cache   *kvCache
+	mu       sync.Mutex
+	cond     *sync.Cond
+	pending  []*trieNode
+	stopped  bool
+	disabled bool
+	done     chan struct{}
+	cache    *kvCache
 
 	consecutiveFailures int // circuit breaker per spec §6.3
 }
@@ -54,13 +62,20 @@ func newDiskWriter(c *kvCache) *diskWriter {
 func (w *diskWriter) enqueue(node *trieNode) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.stopped {
-		// Writer disabled; close the channel to unblock anyone waiting.
-		slog.Debug("kv cache enqueue rejected: writer stopped",
-			"start_offset", node.startOffset(), "tokens", len(node.tokens))
+	if w.stopped || w.disabled {
+		// Writer shut down or tripped the circuit breaker: close the
+		// channel so callers waiting on it aren't stranded. Do NOT clear
+		// the field (see loop() comment about race conditions).
+		reason := "stopped"
+		if w.disabled {
+			reason = "disabled"
+		}
+		slog.Debug("kv cache enqueue rejected",
+			"reason", reason,
+			"start_offset", node.startOffset(),
+			"tokens", len(node.tokens))
 		if node.inflightWrite != nil {
 			close(node.inflightWrite)
-			node.inflightWrite = nil
 		}
 		return
 	}
@@ -77,23 +92,34 @@ func (w *diskWriter) loop() {
 	for {
 		w.mu.Lock()
 		for len(w.pending) == 0 && !w.stopped {
+			// Note: we don't exit on `disabled` alone because the cache
+			// may still be running and scheduleWrite could race — we just
+			// stay here until either (a) stopped fires, or (b) some
+			// no-op enqueue wakes us (only to be dropped by the skipWrite
+			// branch below).
 			w.cond.Wait()
 		}
-		if w.stopped && len(w.pending) == 0 {
+		if len(w.pending) == 0 {
+			// Only reachable when stopped == true.
 			w.mu.Unlock()
 			return
 		}
 		node := w.pending[0]
 		w.pending = w.pending[1:]
-		disabled := w.stopped // snapshot under lock
+		// Circuit breaker: if the writer has been disabled, drain the
+		// queue without writing. Plain shutdown still drains WITH writes.
+		skipWrite := w.disabled
 		w.mu.Unlock()
 
-		if !disabled {
+		if !skipWrite {
 			w.writeOneWithRetry(node)
 		}
+		// Close the channel so waiters unblock. Do NOT clear the field:
+		// main-goroutine code uses isWriteInFlight() (closed-channel check)
+		// to distinguish "done" from "queued". Clearing here would race
+		// with concurrent reads of node.inflightWrite.
 		if node.inflightWrite != nil {
 			close(node.inflightWrite)
-			node.inflightWrite = nil
 		}
 	}
 }
@@ -124,7 +150,7 @@ func (w *diskWriter) writeOneWithRetry(node *trieNode) {
 	failures := w.consecutiveFailures
 	if failures >= 5 {
 		slog.Warn("kv cache writer: disabling after 5 consecutive failures")
-		w.stopped = true
+		w.disabled = true
 		w.cond.Broadcast() // wake loop so it can drain without writing
 	}
 	w.mu.Unlock()
@@ -328,7 +354,11 @@ func (c *kvCache) writeOne(node *trieNode) error {
 	}
 	fname := contentFilename(c.modelDigest, parentHash, node.tokens, len(node.snapshots), dtype)
 	finalPath := filepath.Join(c.cacheDir, fname)
-	tmpPath := finalPath + ".tmp"
+	// MLX's safetensors writer appends ".safetensors" if the path doesn't
+	// already end with it, so the tmp suffix has to be embedded BEFORE the
+	// extension. Otherwise the on-disk file ends up at "<name>.tmp.safetensors"
+	// and the rename of "<name>.tmp" fails with ENOENT.
+	tmpPath := strings.TrimSuffix(finalPath, ".safetensors") + ".tmp.safetensors"
 
 	if err := os.MkdirAll(c.cacheDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir cacheDir: %w", err)
@@ -437,9 +467,9 @@ func (c *kvCache) loadFromDisk(node *trieNode) error {
 		sf.Free()
 		return fmt.Errorf("model_digest mismatch: file=%q cache=%q", h.modelDigest, c.modelDigest)
 	}
-	if h.layerCount != len(c.caches) {
+	if h.layerCount != c.layerCount() {
 		sf.Free()
-		return fmt.Errorf("layer_count mismatch: file=%d cache=%d", h.layerCount, len(c.caches))
+		return fmt.Errorf("layer_count mismatch: file=%d cache=%d", h.layerCount, c.layerCount())
 	}
 
 	startOffset := node.startOffset()
@@ -489,11 +519,14 @@ func (c *kvCache) rehydrate() error {
 	slog.Debug("kv cache rehydrate scanning",
 		"cache_dir", c.cacheDir, "entries", len(entries))
 
-	// Step 1: clean .tmp files (crashed writes).
+	// Step 1: clean tmp files (crashed writes). MLX-written tmp files end
+	// in ".tmp.safetensors"; legacy ".tmp" files (from earlier writers, or
+	// other tools) are also removed defensively.
 	tmpDeleted := 0
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".tmp") {
-			if err := os.Remove(filepath.Join(c.cacheDir, e.Name())); err == nil {
+		name := e.Name()
+		if strings.HasSuffix(name, ".tmp.safetensors") || strings.HasSuffix(name, ".tmp") {
+			if err := os.Remove(filepath.Join(c.cacheDir, name)); err == nil {
 				tmpDeleted++
 			}
 		}
@@ -531,8 +564,8 @@ func (c *kvCache) rehydrate() error {
 			// instance; skip for this rehydration.
 			continue
 		}
-		if h.layerCount != len(c.caches) {
-			slog.Warn("kv cache rehydrate: layer_count mismatch, deleting", "path", path)
+		if h.layerCount != c.layerCount() {
+			slog.Warn("kv cache rehydrate: layer_count mismatch, deleting", "path", path, "file_layers", h.layerCount, "expected", c.layerCount())
 			_ = os.Remove(path)
 			continue
 		}

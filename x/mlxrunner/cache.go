@@ -42,11 +42,21 @@ type kvCache struct {
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
 
 	// Persistence fields. See cache_persist.go.
-	diskBytes   int64       // atomic; sum of diskSize across all nodes
-	diskMax     int64       // -1 or <= 0 disables disk eviction; positive = byte cap
-	modelDigest string      // identifies the model for cacheDir scoping
-	cacheDir    string      // <OLLAMA_KV_CACHE_ROOT>/<modelDigest>; empty when feature disabled
-	writer      *diskWriter // nil when feature disabled
+	diskBytes      int64       // atomic; sum of diskSize across all nodes
+	diskMax        int64       // -1 or <= 0 disables disk eviction; positive = byte cap
+	expectedLayers int         // numLayers passed at construction; used for rehydrate header validation when c.caches is still nil
+	modelDigest    string      // identifies the model for cacheDir scoping
+	cacheDir       string      // <OLLAMA_KV_CACHE_ROOT>/<modelDigest>; empty when feature disabled
+	writer         *diskWriter // nil when feature disabled
+}
+
+// layerCount returns the runtime layer count, falling back to expectedLayers
+// when caches haven't been initialized yet (e.g., during startup rehydrate).
+func (c *kvCache) layerCount() int {
+	if len(c.caches) > 0 {
+		return len(c.caches)
+	}
+	return c.expectedLayers
 }
 
 // newKvCache is the construction entry point for kvCache.
@@ -54,9 +64,14 @@ type kvCache struct {
 // byte-for-byte identical to upstream-main behavior. modelDigest may be
 // empty; that's treated as "feature off" since cache files would be
 // indistinguishable from other models.
+//
+// We do NOT pre-allocate c.caches here because ensureCaches() uses
+// len(c.caches) == 0 as its "uninitialized" sentinel and would otherwise
+// leave a slice of nil Cache entries that crash the prefill loop. The
+// expected layer count is stored separately for the rehydrate cross-check.
 func newKvCache(modelDigest string, numLayers int) *kvCache {
 	c := &kvCache{
-		caches: make([]cache.Cache, numLayers),
+		expectedLayers: numLayers,
 	}
 	c.ensureRoot()
 
@@ -588,7 +603,7 @@ func (c *kvCache) enforceMemoryPolicy() {
 		if cand == nil {
 			break
 		}
-		if cand.inflightWrite != nil {
+		if isWriteInFlight(cand.inflightWrite) {
 			slog.Debug("kv cache memory pass: candidate has in-flight write, deferring",
 				"start_offset", cand.startOffset())
 			return
@@ -737,11 +752,15 @@ func matchedAfterRestore(path []*trieNode, inputs []int32) int {
 
 // scheduleWrite enqueues node for disk write if persistence is enabled
 // and the node isn't already written or in flight. Idempotent.
+//
+// "In flight" means inflightWrite is non-nil AND not yet closed. Once the
+// writer closes the channel (see diskWriter.loop), the node is safe to
+// re-enqueue if needed (e.g., the write failed and a retry is warranted).
 func (c *kvCache) scheduleWrite(node *trieNode) {
 	if c.writer == nil {
 		return // feature disabled
 	}
-	if node.inflightWrite != nil {
+	if isWriteInFlight(node.inflightWrite) {
 		slog.Debug("kv cache scheduleWrite skipped: write in flight",
 			"start_offset", node.startOffset(), "tokens", len(node.tokens))
 		return
@@ -758,6 +777,22 @@ func (c *kvCache) scheduleWrite(node *trieNode) {
 	}
 	node.inflightWrite = make(chan struct{})
 	c.writer.enqueue(node)
+}
+
+// isWriteInFlight returns true if ch represents a pending write: non-nil
+// and not yet closed. Calling code must only inspect node.inflightWrite
+// from the main goroutine; the writer goroutine only closes the channel,
+// never rewrites the field.
+func isWriteInFlight(ch chan struct{}) bool {
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return false // closed — write finished
+	default:
+		return true // still open — write queued or running
+	}
 }
 
 // evictNode evicts a single node from the trie, freeing its snapshot memory.

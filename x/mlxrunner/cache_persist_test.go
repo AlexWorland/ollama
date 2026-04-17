@@ -291,9 +291,12 @@ func TestScheduleWriteIdempotent(t *testing.T) {
 	}
 	<-ch1
 
-	// After write completes, another scheduleWrite is still a no-op (diskPath set).
+	// After write completes, another scheduleWrite is still a no-op because
+	// diskPath is now set. The channel field itself stays non-nil (closed);
+	// the test asserts no NEW channel was allocated.
+	before := node.inflightWrite
 	c.scheduleWrite(node)
-	if node.inflightWrite != nil {
+	if node.inflightWrite != before {
 		t.Error("scheduleWrite re-enqueued an already-persisted node")
 	}
 }
@@ -461,23 +464,30 @@ func TestDiskPassRemovesOverCap(t *testing.T) {
 	c.writer = newDiskWriter(c.kvCache)
 	defer c.teardown()
 
-	c.diskMax = 100 // very small cap
 	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
 	n2 := newTestNodeWithArraySnapshot(t, c.root, []int32{2}, 1024)
 	c.scheduleWrite(n1)
 	<-n1.inflightWrite
 	c.scheduleWrite(n2)
 	<-n2.inflightWrite
+	// Set the cap so it holds exactly one file's worth plus slack. The
+	// on-disk safetensors size for two 1x8 float32 arrays + metadata is
+	// runtime-dependent, so base the cap on actual diskSize.
+	c.diskMax = n2.diskSize + n2.diskSize/2
 
+	// Capture paths before eviction; enforceDiskPolicy clears diskPath on
+	// the evicted node.
+	p1 := n1.diskPath
+	p2 := n2.diskPath
 	// Make n1 older so disk pass picks it first.
 	n1.lastUsed = n1.lastUsed.Add(-time.Hour)
 
 	c.enforceEvictionPolicy()
 
-	if _, err := os.Stat(n1.diskPath); !os.IsNotExist(err) {
+	if _, err := os.Stat(p1); !os.IsNotExist(err) {
 		t.Errorf("disk pass did not delete oldest node's file (err=%v)", err)
 	}
-	if _, err := os.Stat(n2.diskPath); err != nil {
+	if _, err := os.Stat(p2); err != nil {
 		t.Errorf("disk pass deleted too much: %v", err)
 	}
 }
