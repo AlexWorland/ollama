@@ -481,3 +481,97 @@ func TestDiskPassRemovesOverCap(t *testing.T) {
 		t.Errorf("disk pass deleted too much: %v", err)
 	}
 }
+
+func TestRehydrateEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	defer c.teardown()
+
+	if err := c.rehydrate(); err != nil {
+		t.Fatalf("rehydrate on empty dir: %v", err)
+	}
+	if c.diskBytes != 0 {
+		t.Errorf("diskBytes = %d on empty dir", c.diskBytes)
+	}
+}
+
+func TestRehydrateRebuildsSkeleton(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	// Session A: write a parent and a child node.
+	sessA := newTestKvCacheWithDisk(t, dir, "model", 1)
+	sessA.writer = newDiskWriter(sessA.kvCache)
+	n1 := newTestNodeWithArraySnapshot(t, sessA.root, []int32{1, 2}, 1024)
+	sessA.scheduleWrite(n1)
+	<-n1.inflightWrite
+	n2 := newTestNodeWithArraySnapshot(t, n1, []int32{3, 4}, 1024)
+	sessA.scheduleWrite(n2)
+	<-n2.inflightWrite
+	sessA.teardown()
+
+	// Session B: fresh cache, same dir, same model.
+	sessB := newTestKvCacheWithDisk(t, dir, "model", 1)
+	defer sessB.teardown()
+	if err := sessB.rehydrate(); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	if len(sessB.root.children) != 1 {
+		t.Fatalf("root children = %d, want 1", len(sessB.root.children))
+	}
+	n1p := sessB.root.children[0]
+	if len(n1p.tokens) != 2 || n1p.tokens[0] != 1 {
+		t.Errorf("n1p.tokens = %v", n1p.tokens)
+	}
+	if n1p.diskPath == "" {
+		t.Error("rehydrated n1 missing diskPath")
+	}
+	if n1p.snapshots != nil {
+		t.Error("rehydrate should NOT load snapshots (Cold state)")
+	}
+	if len(n1p.children) != 1 {
+		t.Fatalf("n1p children = %d, want 1", len(n1p.children))
+	}
+	if sessB.diskBytes <= 0 {
+		t.Error("diskBytes not updated")
+	}
+}
+
+func TestRehydrateCleansTmpOrphans(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := filepath.Join(dir, "aaa.safetensors.tmp")
+	if err := os.WriteFile(tmpPath, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	defer c.teardown()
+	if err := c.rehydrate(); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Error(".tmp file not cleaned up")
+	}
+}
+
+func TestRehydrateRejectsForeignDigest(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	sessA := newTestKvCacheWithDisk(t, dir, "modelA", 1)
+	sessA.writer = newDiskWriter(sessA.kvCache)
+	n := newTestNodeWithArraySnapshot(t, sessA.root, []int32{1}, 1024)
+	sessA.scheduleWrite(n)
+	<-n.inflightWrite
+	sessA.teardown()
+
+	sessB := newTestKvCacheWithDisk(t, dir, "modelB", 1) // different digest
+	defer sessB.teardown()
+	if err := sessB.rehydrate(); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	if len(sessB.root.children) != 0 {
+		t.Errorf("rehydrate loaded foreign-digest files (%d children)", len(sessB.root.children))
+	}
+}

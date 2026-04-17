@@ -424,6 +424,137 @@ func (c *kvCache) loadFromDisk(node *trieNode) error {
 	return nil
 }
 
+// rehydrate scans c.cacheDir and rebuilds the trie skeleton from safetensors
+// headers. No arrays are loaded; every rebuilt node is Cold (snapshots == nil,
+// diskPath set). Called once during kvCache construction when persistence is
+// enabled. Foreign-digest files are left alone (they may belong to another
+// model's cache instance running concurrently); orphaned and unreadable files
+// are deleted.
+func (c *kvCache) rehydrate() error {
+	if c.cacheDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(c.cacheDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir cacheDir: %w", err)
+	}
+	c.ensureRoot()
+	entries, err := os.ReadDir(c.cacheDir)
+	if err != nil {
+		return fmt.Errorf("readdir: %w", err)
+	}
+
+	// Step 1: clean .tmp files (crashed writes).
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			_ = os.Remove(filepath.Join(c.cacheDir, e.Name()))
+		}
+	}
+
+	// Step 2: scan headers; collect (name, header, size) for our model.
+	type scanned struct {
+		name string
+		path string
+		size int64
+		h    headerFields
+	}
+	var ok []scanned
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".safetensors") {
+			continue
+		}
+		path := filepath.Join(c.cacheDir, name)
+		st, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		h, err := c.readHeader(path)
+		if err != nil {
+			slog.Warn("kv cache rehydrate: unreadable header, deleting", "path", path, "err", err)
+			_ = os.Remove(path)
+			continue
+		}
+		if h.modelDigest != c.modelDigest {
+			// Different model stamped this file. Leave it for another cache
+			// instance; skip for this rehydration.
+			continue
+		}
+		if h.layerCount != len(c.caches) {
+			slog.Warn("kv cache rehydrate: layer_count mismatch, deleting", "path", path)
+			_ = os.Remove(path)
+			continue
+		}
+		ok = append(ok, scanned{name: name, path: path, size: st.Size(), h: h})
+	}
+
+	// Step 3: index by hash, identify orphans (missing parent).
+	nameOf := func(s scanned) string { return strings.TrimSuffix(s.name, ".safetensors") }
+	byName := make(map[string]scanned, len(ok))
+	for _, s := range ok {
+		byName[nameOf(s)] = s
+	}
+	var roots []scanned
+	survivors := make([]scanned, 0, len(ok))
+	for _, s := range ok {
+		if s.h.parentHash == "" {
+			roots = append(roots, s)
+			survivors = append(survivors, s)
+			continue
+		}
+		if _, found := byName[s.h.parentHash]; !found {
+			slog.Warn("kv cache rehydrate: orphan (missing parent), deleting",
+				"path", s.path, "parent", s.h.parentHash)
+			_ = os.Remove(s.path)
+			continue
+		}
+		survivors = append(survivors, s)
+	}
+
+	// Step 4: BFS from roots, building trie nodes. Index children by parent
+	// hash so each step is O(children) rather than O(N).
+	childrenOf := make(map[string][]scanned, len(survivors))
+	for _, s := range survivors {
+		if s.h.parentHash != "" {
+			childrenOf[s.h.parentHash] = append(childrenOf[s.h.parentHash], s)
+		}
+	}
+
+	totalBytes := int64(0)
+	nodes := make(map[string]*trieNode, len(survivors))
+	queue := append([]scanned{}, roots...)
+	for len(queue) > 0 {
+		s := queue[0]
+		queue = queue[1:]
+		var parent *trieNode
+		if s.h.parentHash == "" {
+			parent = c.root
+		} else {
+			parent = nodes[s.h.parentHash]
+			if parent == nil {
+				continue // defensively skip; orphans were filtered above
+			}
+		}
+		n := &trieNode{
+			tokens:    s.h.tokens,
+			endOffset: parent.endOffset + len(s.h.tokens),
+			parent:    parent,
+			diskPath:  s.path,
+			diskSize:  s.size,
+			lastUsed:  s.h.createdAt,
+		}
+		if n.lastUsed.IsZero() {
+			n.lastUsed = time.Now()
+		}
+		parent.children = append(parent.children, n)
+		nodes[nameOf(s)] = n
+		totalBytes += s.size
+		queue = append(queue, childrenOf[nameOf(s)]...)
+	}
+
+	atomic.StoreInt64(&c.diskBytes, totalBytes)
+	return nil
+}
+
 // restoreSnapshotArrays dispatches by snapshot_types metadata to rebuild
 // typed Snapshots from a loaded safetensors file. Unknown types are
 // treated as corrupt (per spec §10.3).
