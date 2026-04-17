@@ -36,6 +36,13 @@ type kvCache struct {
 	activePath    []*trieNode // current root→leaf path with live MLX arrays
 	caches        []cache.Cache
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
+
+	// Persistence fields. See cache_persist.go.
+	diskBytes   int64       // atomic; sum of diskSize across all nodes
+	diskMax     int64       // -1 or <= 0 disables disk eviction; positive = byte cap
+	modelDigest string      // identifies the model for cacheDir scoping
+	cacheDir    string      // <OLLAMA_KV_CACHE_ROOT>/<modelDigest>; empty when feature disabled
+	writer      *diskWriter // nil when feature disabled
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.

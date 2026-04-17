@@ -19,6 +19,12 @@ type trieNode struct {
 	lastUsed  time.Time        // for LRU eviction
 	snapshots []cache.Snapshot // per-layer paged-out snapshot data (nil if not paged out)
 	user      bool             // true = explicit restore point (resist auto-merge)
+
+	// Persistence fields (see .planning/specs/2026-04-16-mlx-kv-cache-persistence-design.md §5.2).
+	diskPath      string        // "" if not persisted; content-addressed filename when set
+	diskSize      int64         // bytes on disk; 0 when diskPath == ""
+	inflightWrite chan struct{} // non-nil while a write is queued or in flight; closed on completion
+	writeAttempts uint8         // retry counter; capped at 3 (see spec §6.3)
 }
 
 // startOffset returns the cumulative token offset at the start of this node's edge.
