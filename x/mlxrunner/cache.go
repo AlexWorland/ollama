@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"time"
 
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
@@ -45,6 +47,40 @@ type kvCache struct {
 	modelDigest string      // identifies the model for cacheDir scoping
 	cacheDir    string      // <OLLAMA_KV_CACHE_ROOT>/<modelDigest>; empty when feature disabled
 	writer      *diskWriter // nil when feature disabled
+}
+
+// newKvCache is the construction entry point for kvCache.
+// When OLLAMA_KV_CACHE_DISK_MAX == 0, returns a cache with no writer —
+// byte-for-byte identical to upstream-main behavior. modelDigest may be
+// empty; that's treated as "feature off" since cache files would be
+// indistinguishable from other models.
+func newKvCache(modelDigest string, numLayers int) *kvCache {
+	c := &kvCache{
+		caches: make([]cache.Cache, numLayers),
+	}
+	c.ensureRoot()
+
+	diskMax := envconfig.KVCacheDiskMax()
+	if diskMax == 0 || modelDigest == "" {
+		return c // feature disabled
+	}
+	c.modelDigest = modelDigest
+	c.cacheDir = filepath.Join(envconfig.KVCacheRoot(), modelDigest)
+	c.diskMax = diskMax
+	if err := c.rehydrate(); err != nil {
+		slog.Warn("kv cache rehydrate failed, starting cold", "err", err)
+	}
+	c.writer = newDiskWriter(c)
+	return c
+}
+
+// shutdown drains pending writes and releases the writer goroutine.
+// Safe to call when persistence is disabled (writer is nil).
+func (c *kvCache) shutdown() {
+	if c == nil || c.writer == nil {
+		return
+	}
+	c.writer.shutdown(15 * time.Second)
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.

@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/ollama/ollama/envconfig"
@@ -163,6 +165,20 @@ func Execute(args []string) error {
 	} {
 		mux.Handle(source, http.RedirectHandler(target, http.StatusPermanentRedirect))
 	}
+
+	// Drain the KV cache writer queue on SIGTERM/SIGINT so the next session
+	// can rehydrate cleanly. The writer's own 15s budget bounds the wait.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		s := <-sigCh
+		slog.Info("received shutdown signal, draining kv cache writer", "signal", s)
+		runner.Shutdown()
+		// Re-raise the signal with the default disposition so the runtime
+		// exits with the expected status.
+		signal.Stop(sigCh)
+		_ = syscall.Kill(syscall.Getpid(), s.(syscall.Signal))
+	}()
 
 	return runner.Run("127.0.0.1", strconv.Itoa(port), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

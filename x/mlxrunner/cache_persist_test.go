@@ -575,3 +575,28 @@ func TestRehydrateRejectsForeignDigest(t *testing.T) {
 		t.Errorf("rehydrate loaded foreign-digest files (%d children)", len(sessB.root.children))
 	}
 }
+
+func TestFeatureDisabledHasNoWriter(t *testing.T) {
+	t.Setenv("OLLAMA_KV_CACHE_DISK_MAX", "0")
+	c := newKvCache("model", 1)
+	if c.writer != nil {
+		t.Error("writer created when OLLAMA_KV_CACHE_DISK_MAX=0")
+	}
+	if c.cacheDir != "" {
+		t.Error("cacheDir set when feature disabled")
+	}
+}
+
+func TestFeatureEnabledCreatesWriter(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OLLAMA_KV_CACHE_ROOT", dir)
+	t.Setenv("OLLAMA_KV_CACHE_DISK_MAX", "-1")
+	c := newKvCache("modelX", 1)
+	defer c.shutdown()
+	if c.writer == nil {
+		t.Error("writer missing with feature enabled")
+	}
+	if !strings.HasSuffix(c.cacheDir, "modelX") {
+		t.Errorf("cacheDir = %q, want suffix modelX", c.cacheDir)
+	}
+}

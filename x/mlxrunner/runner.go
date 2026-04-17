@@ -48,8 +48,17 @@ type Runner struct {
 	Model         base.Model
 	Tokenizer     *tokenizer.Tokenizer
 	Requests      chan Request
-	cache         kvCache
+	cache         *kvCache
 	contextLength int
+}
+
+// Shutdown drains the KV cache writer queue and releases its goroutine.
+// Called from the server's signal handler before exit. Safe to call when
+// persistence is disabled.
+func (r *Runner) Shutdown() {
+	if r != nil && r.cache != nil {
+		r.cache.shutdown()
+	}
 }
 
 func (r *Runner) Load(modelName string) error {
@@ -79,6 +88,10 @@ func (r *Runner) Load(modelName string) error {
 	r.Model = m
 	r.Tokenizer = m.Tokenizer()
 	r.contextLength = m.MaxContextLength()
+	// Use the model name as the digest for cache scoping. It's stable across
+	// restarts of the same model and unique enough to keep different models
+	// from cross-loading each other's snapshots.
+	r.cache = newKvCache(modelName, m.NumLayers())
 
 	mlx.EnableCompile()
 	return nil
