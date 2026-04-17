@@ -543,6 +543,26 @@ func (c *kvCache) enforceEvictionPolicy() {
 		)
 	})
 
+	// Batch-evaluate all leaf candidates' snapshot arrays so MLX can fuse
+	// the graphs. Subsequent per-node Eval calls inside evictNodeToDisk
+	// become no-ops once the tensors are materialized.
+	var batch []*mlx.Array
+	for _, node := range candidates {
+		if len(node.children) != 0 {
+			continue
+		}
+		for _, snap := range node.snapshots {
+			if exp := cache.ExportSnapshot(snap); exp != nil {
+				for _, arr := range exp.Arrays {
+					batch = append(batch, arr)
+				}
+			}
+		}
+	}
+	if len(batch) > 0 {
+		mlx.Eval(batch...)
+	}
+
 	for _, node := range candidates {
 		if c.pagedOutBytes <= maxPagedOutBytes {
 			break
