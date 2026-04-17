@@ -61,8 +61,13 @@ func newKvCache(modelDigest string, numLayers int) *kvCache {
 	c.ensureRoot()
 
 	diskMax := envconfig.KVCacheDiskMax()
-	if diskMax == 0 || modelDigest == "" {
-		return c // feature disabled
+	if diskMax == 0 {
+		slog.Info("kv cache disk persistence disabled (OLLAMA_KV_CACHE_DISK_MAX=0)")
+		return c
+	}
+	if modelDigest == "" {
+		slog.Info("kv cache disk persistence disabled (no model digest)")
+		return c
 	}
 	c.modelDigest = modelDigest
 	c.cacheDir = filepath.Join(envconfig.KVCacheRoot(), modelDigest)
@@ -71,6 +76,11 @@ func newKvCache(modelDigest string, numLayers int) *kvCache {
 		slog.Warn("kv cache rehydrate failed, starting cold", "err", err)
 	}
 	c.writer = newDiskWriter(c)
+	slog.Info("kv cache disk persistence enabled",
+		"cache_dir", c.cacheDir,
+		"model_digest", modelDigest,
+		"num_layers", numLayers,
+		"disk_max_bytes", diskMax)
 	return c
 }
 
@@ -80,7 +90,11 @@ func (c *kvCache) shutdown() {
 	if c == nil || c.writer == nil {
 		return
 	}
-	c.writer.shutdown(15 * time.Second)
+	slog.Info("kv cache shutdown: draining writer", "total_disk_bytes", atomic.LoadInt64(&c.diskBytes))
+	remaining := c.writer.shutdown(15 * time.Second)
+	if remaining > 0 {
+		slog.Warn("kv cache shutdown: timeout exceeded", "undrained", remaining)
+	}
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.
@@ -142,6 +156,8 @@ func (c *kvCache) begin(m base.Model, inputs []int32) *cacheSession {
 	// demotes the failing node to Gone; recompute the matched length to
 	// reflect that the effective prefix may have shrunk.
 	if c.writer != nil {
+		slog.Debug("kv cache begin: walking match path",
+			"path_len", len(matchPath), "matched", originalMatched, "input_len", len(inputs))
 		_ = c.restoreMatchedPath(matchPath)
 		matched = matchedAfterRestore(matchPath, inputs)
 		if originalMatched != matched {
@@ -560,26 +576,36 @@ func (c *kvCache) selectEvictionCandidate(filter func(*trieNode) bool) *trieNode
 }
 
 func (c *kvCache) enforceMemoryPolicy() {
+	if c.pagedOutBytes <= maxPagedOutBytes {
+		return
+	}
+	startBytes := c.pagedOutBytes
+	demoted, deleted := 0, 0
 	for c.pagedOutBytes > maxPagedOutBytes {
 		cand := c.selectEvictionCandidate(func(n *trieNode) bool {
 			return n.snapshots != nil
 		})
 		if cand == nil {
-			return
+			break
 		}
 		if cand.inflightWrite != nil {
-			// Cannot drop safely while a write is in flight; bail this cycle.
+			slog.Debug("kv cache memory pass: candidate has in-flight write, deferring",
+				"start_offset", cand.startOffset())
 			return
 		}
 		if cand.diskPath == "" {
-			// Not yet on disk. If persistence is enabled and we haven't burned
-			// the retry budget, schedule a write and let the next cycle retry.
 			if c.writer != nil && cand.writeAttempts < 3 {
+				slog.Debug("kv cache memory pass: scheduling write before evict",
+					"start_offset", cand.startOffset(), "attempts", cand.writeAttempts)
 				c.scheduleWrite(cand)
 				return
 			}
-			// Permanently un-persisted (feature off, or 3+ failures): legacy delete.
+			slog.Debug("kv cache memory pass: legacy delete (un-persistable)",
+				"start_offset", cand.startOffset(),
+				"writer_enabled", c.writer != nil,
+				"attempts", cand.writeAttempts)
 			c.evictNode(cand)
+			deleted++
 			continue
 		}
 		// Warm -> Cold: drop in-memory snapshots, keep trie node + disk file.
@@ -591,6 +617,18 @@ func (c *kvCache) enforceMemoryPolicy() {
 		}
 		cand.snapshots = nil
 		c.pagedOutBytes -= freed
+		demoted++
+		slog.Debug("kv cache memory pass: Warm->Cold",
+			"start_offset", cand.startOffset(),
+			"freed_bytes", freed,
+			"file", filepath.Base(cand.diskPath))
+	}
+	if demoted > 0 || deleted > 0 {
+		slog.Debug("kv cache memory pass complete",
+			"demoted_to_cold", demoted,
+			"deleted", deleted,
+			"start_bytes", startBytes,
+			"end_bytes", c.pagedOutBytes)
 	}
 }
 
@@ -598,23 +636,42 @@ func (c *kvCache) enforceDiskPolicy() {
 	if c.writer == nil || c.diskMax <= 0 {
 		return
 	}
+	startBytes := atomic.LoadInt64(&c.diskBytes)
+	if startBytes <= c.diskMax {
+		return
+	}
+	evicted := 0
 	for atomic.LoadInt64(&c.diskBytes) > c.diskMax {
 		cand := c.selectEvictionCandidate(func(n *trieNode) bool {
 			return n.diskPath != ""
 		})
 		if cand == nil {
-			return
+			break
 		}
-		if err := os.Remove(cand.diskPath); err != nil && !os.IsNotExist(err) {
-			slog.Warn("kv cache disk evict: remove failed", "path", cand.diskPath, "err", err)
+		path := cand.diskPath
+		size := cand.diskSize
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			slog.Warn("kv cache disk evict: remove failed", "path", path, "err", err)
 		}
-		atomic.AddInt64(&c.diskBytes, -cand.diskSize)
+		newTotal := atomic.AddInt64(&c.diskBytes, -size)
 		cand.diskPath = ""
 		cand.diskSize = 0
+		slog.Debug("kv cache disk pass: evicted",
+			"file", filepath.Base(path),
+			"freed_bytes", size,
+			"total_disk_bytes", newTotal)
 		// Removes the node from the trie. evictNode handles both leaves and
 		// single-child interior nodes; multi-child nodes were filtered out
 		// by the selector.
 		c.evictNode(cand)
+		evicted++
+	}
+	if evicted > 0 {
+		slog.Debug("kv cache disk pass complete",
+			"evicted", evicted,
+			"start_bytes", startBytes,
+			"end_bytes", atomic.LoadInt64(&c.diskBytes),
+			"cap", c.diskMax)
 	}
 }
 
@@ -625,23 +682,33 @@ func (c *kvCache) enforceDiskPolicy() {
 // the tail. Always returns nil today (errors are logged + degraded), but the
 // signature returns an error to leave room for future fail-loud modes.
 func (c *kvCache) restoreMatchedPath(path []*trieNode) error {
+	var warm, restored, gone int
 	for _, node := range path {
 		if node == c.root {
 			continue
 		}
 		if node.snapshots != nil {
+			warm++
 			continue // Warm or just-restored
 		}
 		if node.diskPath == "" {
-			break // Gone: cannot restore from here
+			gone++
+			slog.Debug("kv cache restore stopped at Gone node",
+				"start_offset", node.startOffset(), "tokens", len(node.tokens))
+			break
 		}
 		if err := c.loadFromDisk(node); err != nil {
 			slog.Warn("kv cache restore failed, treating as Gone",
 				"path", node.diskPath, "err", err)
 			node.diskPath = ""
 			node.diskSize = 0
+			gone++
 			break
 		}
+		restored++
+	}
+	if restored > 0 || gone > 0 {
+		slog.Debug("kv cache restore walk", "warm", warm, "restored", restored, "gone", gone)
 	}
 	return nil
 }
@@ -674,11 +741,20 @@ func (c *kvCache) scheduleWrite(node *trieNode) {
 	if c.writer == nil {
 		return // feature disabled
 	}
-	if node.inflightWrite != nil || node.diskPath != "" {
+	if node.inflightWrite != nil {
+		slog.Debug("kv cache scheduleWrite skipped: write in flight",
+			"start_offset", node.startOffset(), "tokens", len(node.tokens))
+		return
+	}
+	if node.diskPath != "" {
+		slog.Debug("kv cache scheduleWrite skipped: already on disk",
+			"path", filepath.Base(node.diskPath), "tokens", len(node.tokens))
 		return
 	}
 	if node.writeAttempts >= 3 {
-		return // permanently failed; leave it to the legacy memory eviction
+		slog.Debug("kv cache scheduleWrite skipped: write permanently failed",
+			"start_offset", node.startOffset(), "attempts", node.writeAttempts)
+		return
 	}
 	node.inflightWrite = make(chan struct{})
 	c.writer.enqueue(node)

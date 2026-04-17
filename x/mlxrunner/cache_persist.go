@@ -44,6 +44,7 @@ func newDiskWriter(c *kvCache) *diskWriter {
 		done:  make(chan struct{}),
 	}
 	w.cond = sync.NewCond(&w.mu)
+	slog.Debug("kv cache writer started", "cache_dir", c.cacheDir, "model_digest", c.modelDigest)
 	go w.loop()
 	return w
 }
@@ -55,6 +56,8 @@ func (w *diskWriter) enqueue(node *trieNode) {
 	defer w.mu.Unlock()
 	if w.stopped {
 		// Writer disabled; close the channel to unblock anyone waiting.
+		slog.Debug("kv cache enqueue rejected: writer stopped",
+			"start_offset", node.startOffset(), "tokens", len(node.tokens))
 		if node.inflightWrite != nil {
 			close(node.inflightWrite)
 			node.inflightWrite = nil
@@ -62,6 +65,10 @@ func (w *diskWriter) enqueue(node *trieNode) {
 		return
 	}
 	w.pending = append(w.pending, node)
+	slog.Debug("kv cache write enqueued",
+		"start_offset", node.startOffset(),
+		"tokens", len(node.tokens),
+		"queue_depth", len(w.pending))
 	w.cond.Signal()
 }
 
@@ -92,11 +99,21 @@ func (w *diskWriter) loop() {
 }
 
 func (w *diskWriter) writeOneWithRetry(node *trieNode) {
+	startedAt := time.Now()
 	err := w.cache.writeOne(node)
 	if err == nil {
 		w.mu.Lock()
+		brokeStreak := w.consecutiveFailures > 0
 		w.consecutiveFailures = 0
 		w.mu.Unlock()
+		if brokeStreak {
+			slog.Debug("kv cache writer: failure streak broken")
+		}
+		slog.Debug("kv cache write completed",
+			"path", node.diskPath,
+			"size_bytes", node.diskSize,
+			"tokens", len(node.tokens),
+			"took", time.Since(startedAt).Truncate(time.Microsecond))
 		return
 	}
 	node.writeAttempts++
@@ -104,14 +121,18 @@ func (w *diskWriter) writeOneWithRetry(node *trieNode) {
 		"path", node.diskPath, "attempt", node.writeAttempts, "err", err)
 	w.mu.Lock()
 	w.consecutiveFailures++
-	if w.consecutiveFailures >= 5 {
+	failures := w.consecutiveFailures
+	if failures >= 5 {
 		slog.Warn("kv cache writer: disabling after 5 consecutive failures")
 		w.stopped = true
 		w.cond.Broadcast() // wake loop so it can drain without writing
 	}
 	w.mu.Unlock()
-	// No auto-requeue: the memory eviction pass (Task 9) calls scheduleWrite
-	// again when the node next becomes a candidate, capped at writeAttempts < 3.
+	if failures < 5 {
+		slog.Debug("kv cache writer failure streak", "consecutive", failures)
+	}
+	// No auto-requeue: the memory eviction pass calls scheduleWrite again when
+	// the node next becomes a candidate, capped at writeAttempts < 3.
 }
 
 // shutdown blocks until the queue drains or the timeout elapses.
@@ -119,9 +140,12 @@ func (w *diskWriter) writeOneWithRetry(node *trieNode) {
 // timeout <= 0 means "wait until done".
 func (w *diskWriter) shutdown(timeout time.Duration) int {
 	w.mu.Lock()
+	queued := len(w.pending)
 	w.stopped = true
 	w.cond.Broadcast()
 	w.mu.Unlock()
+	slog.Debug("kv cache writer shutdown initiated", "queued", queued, "timeout", timeout)
+	startedAt := time.Now()
 
 	if timeout <= 0 {
 		<-w.done
@@ -135,8 +159,11 @@ func (w *diskWriter) shutdown(timeout time.Duration) int {
 	w.mu.Lock()
 	remaining := len(w.pending)
 	w.mu.Unlock()
+	took := time.Since(startedAt).Truncate(time.Millisecond)
 	if remaining > 0 {
-		slog.Warn("kv cache writer shutdown: drained with pending", "remaining", remaining)
+		slog.Warn("kv cache writer shutdown: drained with pending", "remaining", remaining, "took", took)
+	} else {
+		slog.Debug("kv cache writer shutdown complete", "drained", queued, "took", took)
 	}
 	return remaining
 }
@@ -322,7 +349,15 @@ func (c *kvCache) writeOne(node *trieNode) error {
 	}
 	node.diskPath = finalPath
 	node.diskSize = st.Size()
-	atomic.AddInt64(&c.diskBytes, st.Size())
+	totalDisk := atomic.AddInt64(&c.diskBytes, st.Size())
+	slog.Debug("kv cache wrote node",
+		"file", filepath.Base(finalPath),
+		"parent_hash", parentHash,
+		"tokens", len(node.tokens),
+		"layers", len(node.snapshots),
+		"dtype", dtype,
+		"size_bytes", st.Size(),
+		"total_disk_bytes", totalDisk)
 	return nil
 }
 
@@ -413,6 +448,7 @@ func (c *kvCache) loadFromDisk(node *trieNode) error {
 		// Trust the node's own endOffset when set (e.g., not from rehydration).
 		endOffset = node.endOffset
 	}
+	startedAt := time.Now()
 	snaps, err := c.restoreSnapshotArrays(sf, h, startOffset, endOffset)
 	if err != nil {
 		sf.Free()
@@ -421,6 +457,13 @@ func (c *kvCache) loadFromDisk(node *trieNode) error {
 	node.setSnapshots(snaps, &c.pagedOutBytes)
 	node.lastUsed = time.Now()
 	sf.Free()
+	slog.Debug("kv cache loaded from disk",
+		"file", filepath.Base(node.diskPath),
+		"start_offset", startOffset,
+		"end_offset", endOffset,
+		"layers", h.layerCount,
+		"size_bytes", node.diskSize,
+		"took", time.Since(startedAt).Truncate(time.Microsecond))
 	return nil
 }
 
@@ -434,6 +477,7 @@ func (c *kvCache) rehydrate() error {
 	if c.cacheDir == "" {
 		return nil
 	}
+	startedAt := time.Now()
 	if err := os.MkdirAll(c.cacheDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir cacheDir: %w", err)
 	}
@@ -442,12 +486,20 @@ func (c *kvCache) rehydrate() error {
 	if err != nil {
 		return fmt.Errorf("readdir: %w", err)
 	}
+	slog.Debug("kv cache rehydrate scanning",
+		"cache_dir", c.cacheDir, "entries", len(entries))
 
 	// Step 1: clean .tmp files (crashed writes).
+	tmpDeleted := 0
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".tmp") {
-			_ = os.Remove(filepath.Join(c.cacheDir, e.Name()))
+			if err := os.Remove(filepath.Join(c.cacheDir, e.Name())); err == nil {
+				tmpDeleted++
+			}
 		}
+	}
+	if tmpDeleted > 0 {
+		slog.Debug("kv cache rehydrate cleaned tmp files", "count", tmpDeleted)
 	}
 
 	// Step 2: scan headers; collect (name, header, size) for our model.
@@ -552,6 +604,14 @@ func (c *kvCache) rehydrate() error {
 	}
 
 	atomic.StoreInt64(&c.diskBytes, totalBytes)
+	if len(nodes) > 0 || tmpDeleted > 0 {
+		slog.Info("kv cache rehydrated",
+			"nodes", len(nodes),
+			"roots", len(roots),
+			"total_bytes", totalBytes,
+			"tmp_cleaned", tmpDeleted,
+			"took", time.Since(startedAt).Truncate(time.Millisecond))
+	}
 	return nil
 }
 
