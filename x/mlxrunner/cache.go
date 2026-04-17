@@ -359,7 +359,11 @@ func (c *kvCache) advancePath(frontier *trieNode, tokens []int32, endOffset int)
 		lastNode := matchPath[len(matchPath)-1]
 		matchedInEdge := frontier.endOffset + matched - lastNode.startOffset()
 		if matchedInEdge > 0 && matchedInEdge < len(lastNode.tokens) {
-			matchPath[len(matchPath)-1] = splitNode(lastNode, matchedInEdge, c.caches, &c.pagedOutBytes)
+			intermediate := splitNode(lastNode, matchedInEdge, c.caches, &c.pagedOutBytes)
+			matchPath[len(matchPath)-1] = intermediate
+			// The new prefix carries snapshots; persist it so a future cache hit
+			// landing on the split point can reload from disk.
+			c.scheduleWrite(intermediate)
 		}
 	}
 
@@ -406,6 +410,7 @@ func (s *cacheSession) attachSnapshots(node *trieNode, cacheOffset int) {
 	node.setSnapshots(snaps, &c.pagedOutBytes)
 	node.lastUsed = time.Now()
 	slog.Debug("created snapshot", "offset", cacheOffset)
+	c.scheduleWrite(node)
 	c.enforceEvictionPolicy()
 }
 
@@ -498,6 +503,22 @@ func (c *kvCache) enforceEvictionPolicy() {
 		}
 		c.evictNode(best)
 	}
+}
+
+// scheduleWrite enqueues node for disk write if persistence is enabled
+// and the node isn't already written or in flight. Idempotent.
+func (c *kvCache) scheduleWrite(node *trieNode) {
+	if c.writer == nil {
+		return // feature disabled
+	}
+	if node.inflightWrite != nil || node.diskPath != "" {
+		return
+	}
+	if node.writeAttempts >= 3 {
+		return // permanently failed; leave it to the legacy memory eviction
+	}
+	node.inflightWrite = make(chan struct{})
+	c.writer.enqueue(node)
 }
 
 // evictNode evicts a single node from the trie, freeing its snapshot memory.

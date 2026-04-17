@@ -251,3 +251,60 @@ func TestDiskWriterShutdownTimeoutReportsRemaining(t *testing.T) {
 	// count may vary depending on how fast the loop drained before stop.
 	_ = c.writer.shutdown(2 * time.Second)
 }
+
+func TestAttachSnapshotsSchedulesWrite(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{7, 7, 7}, 1024)
+	c.scheduleWrite(node)
+
+	if node.inflightWrite == nil {
+		t.Fatal("scheduleWrite did not create an inflightWrite channel")
+	}
+	select {
+	case <-node.inflightWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("write did not complete within 2s")
+	}
+	if node.diskPath == "" {
+		t.Errorf("node.diskPath still empty after write")
+	}
+}
+
+func TestScheduleWriteIdempotent(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	node := newTestNodeWithArraySnapshot(t, c.root, []int32{1}, 1024)
+	c.scheduleWrite(node)
+	ch1 := node.inflightWrite
+	c.scheduleWrite(node)
+	if node.inflightWrite != ch1 {
+		t.Error("second scheduleWrite replaced the in-flight channel")
+	}
+	<-ch1
+
+	// After write completes, another scheduleWrite is still a no-op (diskPath set).
+	c.scheduleWrite(node)
+	if node.inflightWrite != nil {
+		t.Error("scheduleWrite re-enqueued an already-persisted node")
+	}
+}
+
+func TestScheduleWriteNoOpWhenWriterNil(t *testing.T) {
+	c := &kvCache{caches: make([]cache.Cache, 1)}
+	c.ensureRoot()
+	node := &trieNode{tokens: []int32{1}, parent: c.root}
+	c.root.children = append(c.root.children, node)
+	c.scheduleWrite(node) // must not panic
+	if node.inflightWrite != nil {
+		t.Error("scheduleWrite created channel even though writer is nil")
+	}
+}
