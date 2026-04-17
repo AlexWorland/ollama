@@ -402,6 +402,34 @@ ollama signin
   Replace &lt;username&gt; with your actual Windows user name.
 </Note>
 
+## How do I configure the on-disk KV cache (Apple Silicon / MLX)?
+
+When the Apple-Silicon MLX runner evicts a KV snapshot from memory, it persists
+the snapshot to disk by default so a later request covering the same prefix can
+reload it instead of re-prefilling from scratch. This is controlled by two
+environment variables:
+
+### `OLLAMA_KV_CACHE_DISK_MAX`
+
+Maximum total bytes of on-disk MLX KV cache.
+
+- unset or negative (default `-1`): unlimited (grows until you cap it)
+- `0`: persistence fully disabled — same behavior as prior releases
+- positive: hard cap in bytes, with optional suffix `KiB`, `MiB`, `GiB`
+  (binary), or `KB`, `MB`, `GB` (decimal). Bare letters (`K`, `M`, `G`, `T`)
+  are also treated as binary.
+
+Example: `OLLAMA_KV_CACHE_DISK_MAX=50GiB`
+
+### `OLLAMA_KV_CACHE_ROOT`
+
+Root directory for on-disk KV cache files. One subdirectory per model is
+created underneath. Default: `<OLLAMA_MODELS>/../cache/kv` — a sibling of
+your models store.
+
+Must be on a filesystem that supports atomic rename; standard local
+filesystems (APFS, ext4, XFS, NTFS) all qualify.
+
 ## How can I stop Ollama from starting when I login to my computer?
 
 Ollama for Windows and macOS register as a login item during installation.  You can disable this if you prefer not to have Ollama automatically start.  Ollama will respect this setting across upgrades, unless you uninstall the application.
