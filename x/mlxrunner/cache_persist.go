@@ -9,10 +9,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,14 +23,122 @@ import (
 
 const cacheFormatVersion = "1"
 
-// diskWriter is the writer goroutine handle on kvCache.
-// The full implementation lands in Task 5; this is a placeholder so the
-// kvCache.writer field type-checks until then.
-type diskWriter struct{}
+// diskWriter serializes trieNode writes to disk on a single goroutine.
+// Queue is a mutex-guarded slice (channels caused a shutdown deadlock in
+// the prior branch — see commit 4f6e3111 in the historical persist branch).
+type diskWriter struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	pending []*trieNode
+	stopped bool
+	done    chan struct{}
+	cache   *kvCache
 
-// shutdown is a no-op for the stub. The real implementation in Task 5
-// replaces this with a queue drain + timeout.
-func (w *diskWriter) shutdown(_ time.Duration) int { return 0 }
+	consecutiveFailures int // circuit breaker per spec §6.3
+}
+
+func newDiskWriter(c *kvCache) *diskWriter {
+	w := &diskWriter{
+		cache: c,
+		done:  make(chan struct{}),
+	}
+	w.cond = sync.NewCond(&w.mu)
+	go w.loop()
+	return w
+}
+
+// enqueue schedules node for writing. node.inflightWrite must already be a
+// fresh channel — the loop closes it when this node is done.
+func (w *diskWriter) enqueue(node *trieNode) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		// Writer disabled; close the channel to unblock anyone waiting.
+		if node.inflightWrite != nil {
+			close(node.inflightWrite)
+			node.inflightWrite = nil
+		}
+		return
+	}
+	w.pending = append(w.pending, node)
+	w.cond.Signal()
+}
+
+func (w *diskWriter) loop() {
+	defer close(w.done)
+	for {
+		w.mu.Lock()
+		for len(w.pending) == 0 && !w.stopped {
+			w.cond.Wait()
+		}
+		if w.stopped && len(w.pending) == 0 {
+			w.mu.Unlock()
+			return
+		}
+		node := w.pending[0]
+		w.pending = w.pending[1:]
+		disabled := w.stopped // snapshot under lock
+		w.mu.Unlock()
+
+		if !disabled {
+			w.writeOneWithRetry(node)
+		}
+		if node.inflightWrite != nil {
+			close(node.inflightWrite)
+			node.inflightWrite = nil
+		}
+	}
+}
+
+func (w *diskWriter) writeOneWithRetry(node *trieNode) {
+	err := w.cache.writeOne(node)
+	if err == nil {
+		w.mu.Lock()
+		w.consecutiveFailures = 0
+		w.mu.Unlock()
+		return
+	}
+	node.writeAttempts++
+	slog.Warn("kv cache write failed",
+		"path", node.diskPath, "attempt", node.writeAttempts, "err", err)
+	w.mu.Lock()
+	w.consecutiveFailures++
+	if w.consecutiveFailures >= 5 {
+		slog.Warn("kv cache writer: disabling after 5 consecutive failures")
+		w.stopped = true
+		w.cond.Broadcast() // wake loop so it can drain without writing
+	}
+	w.mu.Unlock()
+	// No auto-requeue: the memory eviction pass (Task 9) calls scheduleWrite
+	// again when the node next becomes a candidate, capped at writeAttempts < 3.
+}
+
+// shutdown blocks until the queue drains or the timeout elapses.
+// Returns the number of still-pending nodes (0 on clean drain).
+// timeout <= 0 means "wait until done".
+func (w *diskWriter) shutdown(timeout time.Duration) int {
+	w.mu.Lock()
+	w.stopped = true
+	w.cond.Broadcast()
+	w.mu.Unlock()
+
+	if timeout <= 0 {
+		<-w.done
+	} else {
+		select {
+		case <-w.done:
+		case <-time.After(timeout):
+		}
+	}
+
+	w.mu.Lock()
+	remaining := len(w.pending)
+	w.mu.Unlock()
+	if remaining > 0 {
+		slog.Warn("kv cache writer shutdown: drained with pending", "remaining", remaining)
+	}
+	return remaining
+}
 
 // contentFilename returns a deterministic .safetensors filename for a node.
 // Same inputs always produce the same output so writes are idempotent

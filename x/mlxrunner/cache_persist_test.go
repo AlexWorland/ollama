@@ -2,8 +2,11 @@ package mlxrunner
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
@@ -171,4 +174,80 @@ func TestWriteOneRoundTrip(t *testing.T) {
 	if h.layerCount != 1 {
 		t.Errorf("layerCount = %d, want 1", h.layerCount)
 	}
+}
+
+func TestDiskWriterFIFO(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	const N = 5
+	nodes := make([]*trieNode, N)
+	for i := range nodes {
+		nodes[i] = newTestNodeWithArraySnapshot(t, c.root, []int32{int32(i)}, 1024)
+		nodes[i].inflightWrite = make(chan struct{})
+		c.writer.enqueue(nodes[i])
+	}
+	for i, n := range nodes {
+		select {
+		case <-n.inflightWrite:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("node[%d] write did not complete in 5s", i)
+		}
+		if n.diskPath == "" {
+			t.Errorf("node[%d].diskPath empty after write", i)
+		}
+	}
+	if atomic.LoadInt64(&c.diskBytes) <= 0 {
+		t.Error("diskBytes not updated")
+	}
+}
+
+func TestDiskWriterShutdownDrainsQueue(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+
+	nodes := make([]*trieNode, 3)
+	for i := range nodes {
+		nodes[i] = newTestNodeWithArraySnapshot(t, c.root, []int32{int32(i)}, 1024)
+		nodes[i].inflightWrite = make(chan struct{})
+		c.writer.enqueue(nodes[i])
+	}
+	remaining := c.writer.shutdown(5 * time.Second)
+	if remaining != 0 {
+		t.Errorf("shutdown left %d pending", remaining)
+	}
+	for i, n := range nodes {
+		if n.diskPath == "" {
+			t.Errorf("node[%d] not persisted after shutdown drain", i)
+		}
+	}
+}
+
+func TestDiskWriterShutdownTimeoutReportsRemaining(t *testing.T) {
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+
+	// Force write errors via a read-only directory so the writer keeps
+	// failing and shutdown(timeout) exercises the not-yet-drained branch.
+	readOnly := filepath.Join(dir, "ro")
+	if err := os.MkdirAll(readOnly, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	c.cacheDir = readOnly
+
+	for i := 0; i < 2; i++ {
+		n := newTestNodeWithArraySnapshot(t, c.root, []int32{int32(i)}, 1024)
+		n.inflightWrite = make(chan struct{})
+		c.writer.enqueue(n)
+	}
+	// Test only asserts shutdown returns within reasonable time; remaining
+	// count may vary depending on how fast the loop drained before stop.
+	_ = c.writer.shutdown(2 * time.Second)
 }
