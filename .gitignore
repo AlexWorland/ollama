@@ -16,3 +16,8 @@ llama/build
 llama/vendor
 /ollama
 integration/testdata/models/
+
+# Agent/tooling scratch directories
+.claude/
+.omc/
+.omx/
