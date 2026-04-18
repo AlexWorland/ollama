@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"fmt"
+
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
@@ -37,6 +39,105 @@ type Snapshot interface {
 	Size() int
 	// Close unpins the snapshot's arrays so they can be freed by Sweep.
 	Close()
+}
+
+// SerializableSnapshot is a Snapshot whose backing arrays can be written to
+// and read back from a safetensors file. Snapshot types that don't implement
+// this interface are skipped by the persistence layer (the writer refuses to
+// produce files with partial coverage).
+type SerializableSnapshot interface {
+	Snapshot
+	// SnapshotType returns the tag stored in safetensors snapshot_types
+	// metadata (e.g. "kv"). The same tag is later passed to
+	// NewSnapshotFromArrays to reconstruct the snapshot on load.
+	SnapshotType() string
+	// CollectArrays returns the field-name -> array map the persistence
+	// layer serializes, along with a cleanup that releases any arrays the
+	// snapshot allocated solely for serialization (e.g. scalars packed
+	// into 1-element arrays). The caller must invoke cleanup after the
+	// write completes; snapshot-owned arrays (keys/values) remain owned
+	// by the snapshot and are released by Close.
+	CollectArrays() (arrays map[string]*mlx.Array, cleanup func())
+}
+
+// SnapshotType* are the canonical tags stored in safetensors snapshot_types
+// metadata. Callers that read or write these tags should use these constants
+// rather than literals — a typo produces a mis-tagged file that rehydrate
+// silently invalidates.
+const (
+	SnapshotTypeKV        = "kv"
+	SnapshotTypeRecurrent = "recurrent"
+	SnapshotTypeRotating  = "rotating"
+	SnapshotTypeEmpty     = "empty"
+	SnapshotTypeUnknown   = "unknown"
+)
+
+// snapshotTypeFields lists the field names each snapshot type writes via
+// CollectArrays. Persistence layers use this to know which safetensors
+// keys to read per layer, without having to enumerate the file. The
+// "empty" type is a valid sentinel for layers that have no state yet
+// (e.g. a recurrent layer at the start of a conversation) — it carries
+// no fields, takes no disk space, and restores to a nil Snapshot.
+var snapshotTypeFields = map[string][]string{
+	SnapshotTypeKV:        {"keys", "values"},
+	SnapshotTypeRecurrent: {"conv", "delta"},
+	SnapshotTypeRotating:  {"keys", "values", "idx"},
+	SnapshotTypeEmpty:     {},
+}
+
+// SnapshotFieldNames returns the per-type field names a SerializableSnapshot
+// produces. The ok return distinguishes "valid type with no fields" (e.g.
+// "empty") from "unknown type".
+func SnapshotFieldNames(snapshotType string) (names []string, ok bool) {
+	names, ok = snapshotTypeFields[snapshotType]
+	return
+}
+
+// NewSnapshotFromArrays reconstructs a snapshot of the given type from
+// arrays previously returned by CollectArrays. Ownership of the arrays
+// transfers to the returned Snapshot, which unpins them on Close. The
+// "empty" type returns (nil, nil) — downstream restore logic already
+// handles nil snapshots as "this layer had no state".
+func NewSnapshotFromArrays(snapshotType string, fields map[string]*mlx.Array, fromOffset, toOffset int) (Snapshot, error) {
+	switch snapshotType {
+	case SnapshotTypeEmpty:
+		return nil, nil
+	case SnapshotTypeKV:
+		k, v := fields["keys"], fields["values"]
+		if k == nil || v == nil {
+			return nil, fmt.Errorf("kv snapshot missing keys/values")
+		}
+		return &kvSnapshot{keys: k, values: v, fromOffset: fromOffset, toOffset: toOffset}, nil
+	case SnapshotTypeRecurrent:
+		conv, delta := fields["conv"], fields["delta"]
+		if conv == nil || delta == nil {
+			return nil, fmt.Errorf("recurrent snapshot missing conv/delta")
+		}
+		// Recurrent state is cumulative up to the end of the trie edge;
+		// Restore() will only succeed when target == offset, which is toOffset.
+		return &recurrentSnapshot{convState: conv, deltaState: delta, offset: toOffset}, nil
+	case SnapshotTypeRotating:
+		k, v, idxArr := fields["keys"], fields["values"], fields["idx"]
+		if k == nil || v == nil || idxArr == nil {
+			return nil, fmt.Errorf("rotating snapshot missing keys/values/idx")
+		}
+		// idx is a 1-element int32 helper that encodes the rotating buffer
+		// write position. Read the scalar and release the helper array — the
+		// snapshot holds idx as a plain int; Close() handles keys/values.
+		idxVal := idxArr.Int()
+		mlx.Unpin(idxArr)
+		return &rotatingSnapshot{
+			kvSnapshot: kvSnapshot{
+				keys:       k,
+				values:     v,
+				fromOffset: fromOffset,
+				toOffset:   toOffset,
+			},
+			idx: idxVal,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown snapshot type %q", snapshotType)
+	}
 }
 
 type KVCache struct {
@@ -97,25 +198,11 @@ type kvSnapshot struct {
 	fromOffset, toOffset int
 }
 
-func (s *kvSnapshot) Size() int { return s.keys.NumBytes() + s.values.NumBytes() }
-func (s *kvSnapshot) Close()    { mlx.Unpin(s.keys, s.values) }
-
-// Keys and Values expose the underlying mlx arrays for the persistence layer
-// (see x/mlxrunner/cache_persist.go). Callers must not mutate them.
-func (s *kvSnapshot) Keys() *mlx.Array   { return s.keys }
-func (s *kvSnapshot) Values() *mlx.Array { return s.values }
-
-// NewKVSnapshotFromArrays rebuilds a paged-out KV snapshot from externally-
-// produced arrays (e.g. loaded from a safetensors file). fromOffset and
-// toOffset are the absolute token range this snapshot covers. The returned
-// Snapshot owns the arrays and will Unpin them on Close.
-func NewKVSnapshotFromArrays(keys, values *mlx.Array, fromOffset, toOffset int) Snapshot {
-	return &kvSnapshot{
-		keys:       keys,
-		values:     values,
-		fromOffset: fromOffset,
-		toOffset:   toOffset,
-	}
+func (s *kvSnapshot) Size() int           { return s.keys.NumBytes() + s.values.NumBytes() }
+func (s *kvSnapshot) Close()               { mlx.Unpin(s.keys, s.values) }
+func (s *kvSnapshot) SnapshotType() string { return SnapshotTypeKV }
+func (s *kvSnapshot) CollectArrays() (map[string]*mlx.Array, func()) {
+	return map[string]*mlx.Array{"keys": s.keys, "values": s.values}, func() {}
 }
 
 func (c *KVCache) Snapshot(fromOffset int) Snapshot {
@@ -153,7 +240,14 @@ func (c *KVCache) Restore(snapshot Snapshot, target int) bool {
 		return true
 	}
 
-	snap := snapshot.(*kvSnapshot)
+	// Soft type assertion: a cross-type snapshot (e.g. a *rotatingSnapshot fed
+	// to a KVCache because a rehydrated file's per-layer type tag doesn't
+	// match the runtime cache architecture) must degrade to a miss, not panic
+	// the subprocess. The caller treats false as "unrestorable" and purges.
+	snap, ok := snapshot.(*kvSnapshot)
+	if !ok {
+		return false
+	}
 
 	if target > snap.toOffset || c.offset < snap.fromOffset {
 		return false
@@ -181,8 +275,16 @@ func (c *KVCache) Merge(parent, child Snapshot) Snapshot {
 		}
 		return nil
 	}
-	p := parent.(*kvSnapshot)
-	ch := child.(*kvSnapshot)
+	// Soft type assertions: a cross-type snapshot would otherwise panic.
+	// Returning nil after closing both inputs drops the merge result; the
+	// caller treats that as a trie-level reconciliation signal.
+	p, pok := parent.(*kvSnapshot)
+	ch, cok := child.(*kvSnapshot)
+	if !pok || !cok {
+		parent.Close()
+		child.Close()
+		return nil
+	}
 
 	mk := p.keys.Concatenate(2, ch.keys)
 	mv := p.values.Concatenate(2, ch.values)
@@ -204,7 +306,13 @@ func (c *KVCache) Split(snapshot Snapshot, at int) (Snapshot, Snapshot) {
 	if snapshot == nil {
 		return nil, nil
 	}
-	snap := snapshot.(*kvSnapshot)
+	// Soft type assertion: on cross-type mismatch, return the snapshot as
+	// the child half (same shape as the "can't split" fallback for other
+	// cache types) instead of panicking.
+	snap, ok := snapshot.(*kvSnapshot)
+	if !ok {
+		return nil, snapshot
+	}
 	splitIdx := at - snap.fromOffset
 	seqLen := snap.toOffset - snap.fromOffset
 	if splitIdx <= 0 {
@@ -369,7 +477,28 @@ type rotatingSnapshot struct {
 }
 
 func (s *rotatingSnapshot) Size() int { return s.kvSnapshot.Size() }
-func (s *rotatingSnapshot) Close()    { s.kvSnapshot.Close() }
+
+// SnapshotType overrides the promoted kvSnapshot method so serialized
+// rotating snapshots are tagged "rotating" (not "kv") and round-trip back
+// to *rotatingSnapshot on restore. Without this override Go method promotion
+// silently returns "kv" → files get mis-tagged → *kvSnapshot is fed to
+// RotatingKVCache.Restore and panics on type assertion.
+func (s *rotatingSnapshot) SnapshotType() string { return SnapshotTypeRotating }
+
+// CollectArrays returns the snapshot's serializable fields. The idx scalar
+// is packed fresh into a 1-element int32 array for the safetensors pipeline
+// and unpinned by cleanup — keeping serialization state off the snapshot.
+func (s *rotatingSnapshot) CollectArrays() (map[string]*mlx.Array, func()) {
+	idxArr := mlx.FromValue(int(s.idx))
+	mlx.Pin(idxArr)
+	return map[string]*mlx.Array{
+			"keys":   s.keys,
+			"values": s.values,
+			"idx":    idxArr,
+		}, func() {
+			mlx.Unpin(idxArr)
+		}
+}
 
 func (c *RotatingKVCache) Snapshot(fromOffset int) Snapshot {
 	if c.keys == nil || c.offset <= fromOffset {
@@ -413,7 +542,11 @@ func (c *RotatingKVCache) Restore(snapshot Snapshot, target int) bool {
 		return true
 	}
 
-	snap := snapshot.(*rotatingSnapshot)
+	// Soft type assertion: cross-type snapshot degrades to a miss.
+	snap, ok := snapshot.(*rotatingSnapshot)
+	if !ok {
+		return false
+	}
 
 	if target > snap.toOffset {
 		return false

@@ -42,21 +42,11 @@ type kvCache struct {
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
 
 	// Persistence fields. See cache_persist.go.
-	diskBytes      int64       // atomic; sum of diskSize across all nodes
-	diskMax        int64       // -1 or <= 0 disables disk eviction; positive = byte cap
-	expectedLayers int         // numLayers passed at construction; used for rehydrate header validation when c.caches is still nil
-	modelDigest    string      // identifies the model for cacheDir scoping
-	cacheDir       string      // <OLLAMA_KV_CACHE_ROOT>/<modelDigest>; empty when feature disabled
-	writer         *diskWriter // nil when feature disabled
-}
-
-// layerCount returns the runtime layer count, falling back to expectedLayers
-// when caches haven't been initialized yet (e.g., during startup rehydrate).
-func (c *kvCache) layerCount() int {
-	if len(c.caches) > 0 {
-		return len(c.caches)
-	}
-	return c.expectedLayers
+	diskBytes   int64       // atomic; sum of diskSize across all nodes
+	diskMax     int64       // -1 or <= 0 disables disk eviction; positive = byte cap
+	modelDigest string      // identifies the model for cacheDir scoping
+	cacheDir    string      // <OLLAMA_KV_CACHE_ROOT>/<modelDigest>; empty when feature disabled
+	writer      *diskWriter // nil when feature disabled
 }
 
 // newKvCache is the construction entry point for kvCache.
@@ -64,14 +54,12 @@ func (c *kvCache) layerCount() int {
 // byte-for-byte identical to upstream-main behavior. modelDigest may be
 // empty; that's treated as "feature off" since cache files would be
 // indistinguishable from other models.
-//
-// We do NOT pre-allocate c.caches here because ensureCaches() uses
-// len(c.caches) == 0 as its "uninitialized" sentinel and would otherwise
-// leave a slice of nil Cache entries that crash the prefill loop. The
-// expected layer count is stored separately for the rehydrate cross-check.
 func newKvCache(modelDigest string, numLayers int) *kvCache {
+	// Pre-allocate caches with nil entries so len(c.caches) reports the
+	// layer count during rehydrate (before ensureCaches has seen the model).
+	// ensureCaches treats a slice of nil entries as still-uninitialized.
 	c := &kvCache{
-		expectedLayers: numLayers,
+		caches: make([]cache.Cache, numLayers),
 	}
 	c.ensureRoot()
 
@@ -99,16 +87,73 @@ func newKvCache(modelDigest string, numLayers int) *kvCache {
 	return c
 }
 
-// shutdown drains pending writes and releases the writer goroutine.
-// Safe to call when persistence is disabled (writer is nil).
+// shutdownBudget caps how long shutdown will spend flushing dirty Warm nodes.
+// 15s matches the old writer-drain budget; at ~25ms per write this covers a
+// few hundred nodes worth of flush. Anything beyond that is dropped (oldest
+// first) so the process can exit promptly.
+const shutdownBudget = 15 * time.Second
+
+// shutdown persists every Warm node that doesn't yet have a disk file, then
+// releases the writer. Safe to call when persistence is disabled (writer nil).
 func (c *kvCache) shutdown() {
+	c.shutdownWithBudget(shutdownBudget)
+}
+
+// shutdownWithBudget is the test-parameterizable form of shutdown.
+// Ordering: newest-first by lastUsed — a budget-constrained shutdown keeps
+// the most recently used data. Dropped nodes are left Warm in memory and
+// vanish with the process.
+func (c *kvCache) shutdownWithBudget(budget time.Duration) {
 	if c == nil || c.writer == nil {
 		return
 	}
-	slog.Info("kv cache shutdown: draining writer", "total_disk_bytes", atomic.LoadInt64(&c.diskBytes))
-	remaining := c.writer.shutdown(15 * time.Second)
-	if remaining > 0 {
-		slog.Warn("kv cache shutdown: timeout exceeded", "undrained", remaining)
+
+	// Parents must flush before children: a child's disk file references its
+	// parent's hash, so dropping the parent mid-budget orphans the child on
+	// next rehydrate. Sort by depth ascending first, then newest-first within
+	// a depth band so budget pressure still drops the oldest siblings.
+	//
+	// Track depth during the walk so the comparator doesn't re-walk the parent
+	// chain on every comparison (SortFunc is O(N log N) calls × O(depth) walk
+	// = O(N² log N) worst case for deep tries).
+	type dirtyNode struct {
+		n *trieNode
+		d int
+	}
+	var dirty []dirtyNode
+	walkDepth(c.root, 0, func(n *trieNode, d int) bool {
+		if n != c.root && n.snapshots != nil && n.diskPath == "" {
+			dirty = append(dirty, dirtyNode{n, d})
+		}
+		return true
+	})
+	slices.SortFunc(dirty, func(a, b dirtyNode) int {
+		if d := a.d - b.d; d != 0 {
+			return d
+		}
+		return b.n.lastUsed.Compare(a.n.lastUsed)
+	})
+
+	slog.Info("kv cache shutdown: flushing warm nodes",
+		"count", len(dirty), "total_disk_bytes", atomic.LoadInt64(&c.diskBytes))
+
+	deadline := time.Now().Add(budget)
+	flushed, dropped := 0, 0
+	for _, d := range dirty {
+		if time.Now().After(deadline) {
+			dropped = len(dirty) - flushed
+			break
+		}
+		c.scheduleWrite(d.n)
+		if d.n.diskPath != "" {
+			flushed++
+		}
+	}
+	if dropped > 0 {
+		slog.Warn("kv cache shutdown: budget exceeded, dropping oldest nodes",
+			"flushed", flushed, "dropped", dropped, "budget", budget)
+	} else {
+		slog.Info("kv cache shutdown: flush complete", "flushed", flushed)
 	}
 }
 
@@ -136,14 +181,19 @@ type cacheSession struct {
 }
 
 func (c *kvCache) ensureCaches(m base.Model) {
-	if len(c.caches) != 0 {
+	// Sentinel: newKvCache pre-allocates the slice with nil entries so
+	// rehydrate has the right layer count. A non-nil first entry means
+	// ensureCaches already ran this session.
+	if len(c.caches) > 0 && c.caches[0] != nil {
 		return
 	}
 	if cacheFactory, ok := m.(interface{ NewCaches() []cache.Cache }); ok {
 		c.caches = cacheFactory.NewCaches()
 		return
 	}
-	c.caches = make([]cache.Cache, m.NumLayers())
+	if len(c.caches) == 0 {
+		c.caches = make([]cache.Cache, m.NumLayers())
+	}
 	for i := range c.caches {
 		c.caches[i] = cache.NewKVCache()
 	}
@@ -167,23 +217,27 @@ func (c *kvCache) begin(m base.Model, inputs []int32) *cacheSession {
 	matchPath, matched := findBestMatch(c.root, inputs)
 	originalMatched := matched
 
-	// Restore any Cold nodes on the match path before paging in. Failure
-	// demotes the failing node to Gone; recompute the matched length to
-	// reflect that the effective prefix may have shrunk.
-	if c.writer != nil {
-		slog.Debug("kv cache begin: walking match path",
-			"path_len", len(matchPath), "matched", originalMatched, "input_len", len(inputs))
-		_ = c.restoreMatchedPath(matchPath)
-		matched = matchedAfterRestore(matchPath, inputs)
-		if originalMatched != matched {
-			slog.Debug("kv cache restore truncated match", "from", originalMatched, "to", matched)
-		}
-	}
-
-	// Always keep at least one token to re-evaluate so the
-	// pipeline can seed token generation from it.
+	// Always keep at least one token to re-evaluate so the pipeline can
+	// seed token generation from it. Apply the holdback BEFORE restoring
+	// Cold nodes — otherwise we'd load disk files for tail nodes about to
+	// be trimmed off, wasting I/O and MLX memory on every cache-hit request.
 	if matched == len(inputs) && matched > 0 {
 		matchPath, matched = findBestMatch(c.root, inputs[:len(inputs)-1])
+	}
+
+	// Restore any Cold nodes on the trimmed match path before paging in.
+	// Failure unlinks the bad file (F2) and the node becomes Gone; recompute
+	// the matched length so switchToPath only pages in what's actually live.
+	if c.writer != nil {
+		slog.Debug("kv cache begin: walking match path",
+			"path_len", len(matchPath), "matched", matched, "input_len", len(inputs))
+		_ = c.restoreMatchedPath(matchPath, matched)
+		postRestore := matchedAfterRestore(matchPath, matched)
+		if postRestore < matched {
+			slog.Debug("kv cache restore shrunk match (Gone node on path)",
+				"from", matched, "to", postRestore)
+			matched = postRestore
+		}
 	}
 
 	// Switch to the matched path, paging in/out as needed.
@@ -536,8 +590,10 @@ func (s *cacheSession) attachSnapshots(node *trieNode, cacheOffset int) {
 	}
 	node.setSnapshots(snaps, &c.pagedOutBytes)
 	node.lastUsed = time.Now()
-	slog.Debug("created snapshot", "offset", cacheOffset)
-	c.scheduleWrite(node)
+	// Writes are deferred to eviction and shutdown — see kvCache.shutdown.
+	// Keeping prefill-boundary snapshots off disk avoids ~15× serialize+fsync
+	// per long-prefill request and saves space on nodes that get extended
+	// in-place by the next turn before ever being evicted.
 	c.enforceEvictionPolicy()
 }
 
@@ -609,15 +665,22 @@ func (c *kvCache) enforceEvictionPolicy() {
 	c.enforceDiskPolicy()
 }
 
-// selectEvictionCandidate runs the existing selector rule (oldest lastUsed,
-// then deepest endOffset, then largest snapshotBytes) over nodes that satisfy
-// the supplied filter, skipping root / activePath / multi-child branch points.
-func (c *kvCache) selectEvictionCandidate(filter func(*trieNode) bool) *trieNode {
-	activeSet := make(map[*trieNode]bool, len(c.activePath))
-	for _, n := range c.activePath {
-		activeSet[n] = true
+// collectEvictionCandidates walks the trie once, collecting nodes that pass
+// the supplied filter (skipping root, activePath members, and multi-child
+// branch points) sorted by eviction priority: oldest lastUsed first, then
+// deepest endOffset, then largest snapshotBytes. snapshotBytes is computed
+// once per node and stored alongside so the comparator is O(1).
+//
+// Earlier designs rescanned the trie for every eviction, producing O(N²)
+// sweeps under sustained pressure. Callers now batch the scan and iterate
+// the result, re-verifying each candidate is still eligible since
+// evictNode/mergeWithChild can orphan or reshape nodes between iterations.
+func (c *kvCache) collectEvictionCandidates(filter func(*trieNode) bool, activeSet map[*trieNode]bool) []*trieNode {
+	type scored struct {
+		n     *trieNode
+		bytes int64
 	}
-	var best *trieNode
+	var out []scored
 	walkNodes(c.root, func(n *trieNode) bool {
 		if n == c.root || activeSet[n] || len(n.children) > 1 {
 			return true
@@ -625,16 +688,55 @@ func (c *kvCache) selectEvictionCandidate(filter func(*trieNode) bool) *trieNode
 		if !filter(n) {
 			return true
 		}
-		if best == nil || cmp.Or(
-			n.lastUsed.Compare(best.lastUsed),
-			cmp.Compare(best.endOffset, n.endOffset),
-			cmp.Compare(best.snapshotBytes(), n.snapshotBytes()),
-		) < 0 {
-			best = n
-		}
+		out = append(out, scored{n: n, bytes: n.snapshotBytes()})
 		return true
 	})
-	return best
+	slices.SortFunc(out, func(a, b scored) int {
+		return cmp.Or(
+			a.n.lastUsed.Compare(b.n.lastUsed),
+			cmp.Compare(b.n.endOffset, a.n.endOffset),
+			cmp.Compare(b.bytes, a.bytes),
+		)
+	})
+	nodes := make([]*trieNode, len(out))
+	for i, s := range out {
+		nodes[i] = s.n
+	}
+	return nodes
+}
+
+// selectEvictionCandidate returns the single highest-priority candidate
+// matching the filter, or nil if none exists. Thin wrapper over
+// collectEvictionCandidates for callers that want a one-shot selector.
+func (c *kvCache) selectEvictionCandidate(filter func(*trieNode) bool) *trieNode {
+	activeSet := buildActiveSet(c.activePath)
+	cands := c.collectEvictionCandidates(filter, activeSet)
+	if len(cands) == 0 {
+		return nil
+	}
+	return cands[0]
+}
+
+func buildActiveSet(path []*trieNode) map[*trieNode]bool {
+	s := make(map[*trieNode]bool, len(path))
+	for _, n := range path {
+		s[n] = true
+	}
+	return s
+}
+
+// stillEligible re-checks a candidate pulled from a cached sort. Between
+// the scan and the action, evictNode or mergeWithChild may have orphaned
+// the node (parent set to nil) or pulled its sibling up so it now has
+// >1 children. activeSet is stable across a single eviction pass.
+func stillEligible(n *trieNode, root *trieNode, activeSet map[*trieNode]bool, filter func(*trieNode) bool) bool {
+	if n == root || n.parent == nil {
+		return false
+	}
+	if activeSet[n] || len(n.children) > 1 {
+		return false
+	}
+	return filter(n)
 }
 
 func (c *kvCache) enforceMemoryPolicy() {
@@ -643,46 +745,49 @@ func (c *kvCache) enforceMemoryPolicy() {
 	}
 	startBytes := c.pagedOutBytes
 	demoted, deleted := 0, 0
+	activeSet := buildActiveSet(c.activePath)
+	filter := func(n *trieNode) bool { return n.snapshots != nil }
+
 	for c.pagedOutBytes > maxPagedOutBytes {
-		cand := c.selectEvictionCandidate(func(n *trieNode) bool {
-			return n.snapshots != nil
-		})
-		if cand == nil {
+		cands := c.collectEvictionCandidates(filter, activeSet)
+		if len(cands) == 0 {
 			break
 		}
-		// Note: synchronous writeNode means a write can never be "in flight"
-		// from the perspective of this pass — writes complete before the
-		// pipeline ever returns control. The check that used to live here
-		// (for the old async writer) is now unnecessary.
-		if cand.diskPath == "" {
-			if c.writer != nil && cand.writeAttempts < 3 {
-				slog.Debug("kv cache memory pass: scheduling write before evict",
-					"start_offset", cand.startOffset(), "attempts", cand.writeAttempts)
-				c.scheduleWrite(cand)
-				return
+		progress := false
+		for _, cand := range cands {
+			if c.pagedOutBytes <= maxPagedOutBytes {
+				break
 			}
-			slog.Debug("kv cache memory pass: legacy delete (un-persistable)",
-				"start_offset", cand.startOffset(),
-				"writer_enabled", c.writer != nil,
-				"attempts", cand.writeAttempts)
-			c.evictNode(cand)
-			deleted++
-			continue
-		}
-		// Warm -> Cold: drop in-memory snapshots, keep trie node + disk file.
-		freed := cand.snapshotBytes()
-		for _, s := range cand.snapshots {
-			if s != nil {
-				s.Close()
+			if !stillEligible(cand, c.root, activeSet, filter) {
+				continue
 			}
+			if cand.diskPath == "" {
+				if c.writer != nil {
+					c.scheduleWrite(cand)
+					// scheduleWrite may transition this node to Cold;
+					// re-scan to pick up the new landscape.
+					return
+				}
+				c.evictNode(cand)
+				deleted++
+				progress = true
+				continue
+			}
+			// Warm -> Cold: drop in-memory snapshots, keep trie node + disk file.
+			freed := cand.snapshotBytes()
+			for _, s := range cand.snapshots {
+				if s != nil {
+					s.Close()
+				}
+			}
+			cand.snapshots = nil
+			c.pagedOutBytes -= freed
+			demoted++
+			progress = true
 		}
-		cand.snapshots = nil
-		c.pagedOutBytes -= freed
-		demoted++
-		slog.Debug("kv cache memory pass: Warm->Cold",
-			"start_offset", cand.startOffset(),
-			"freed_bytes", freed,
-			"file", filepath.Base(cand.diskPath))
+		if !progress {
+			break
+		}
 	}
 	if demoted > 0 || deleted > 0 {
 		slog.Debug("kv cache memory pass complete",
@@ -701,31 +806,40 @@ func (c *kvCache) enforceDiskPolicy() {
 	if startBytes <= c.diskMax {
 		return
 	}
+	activeSet := buildActiveSet(c.activePath)
+	filter := func(n *trieNode) bool { return n.diskPath != "" }
 	evicted := 0
+
 	for atomic.LoadInt64(&c.diskBytes) > c.diskMax {
-		cand := c.selectEvictionCandidate(func(n *trieNode) bool {
-			return n.diskPath != ""
-		})
-		if cand == nil {
+		cands := c.collectEvictionCandidates(filter, activeSet)
+		if len(cands) == 0 {
 			break
 		}
-		path := cand.diskPath
-		size := cand.diskSize
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			slog.Warn("kv cache disk evict: remove failed", "path", path, "err", err)
+		progress := false
+		for _, cand := range cands {
+			if atomic.LoadInt64(&c.diskBytes) <= c.diskMax {
+				break
+			}
+			if !stillEligible(cand, c.root, activeSet, filter) {
+				continue
+			}
+			path := cand.diskPath
+			size := cand.diskSize
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				slog.Warn("kv cache disk evict: remove failed", "path", path, "err", err)
+			}
+			atomic.AddInt64(&c.diskBytes, -size)
+			cand.diskPath = ""
+			cand.diskSize = 0
+			// evictNode handles both leaves and single-child interior nodes;
+			// multi-child nodes were filtered out by the selector.
+			c.evictNode(cand)
+			evicted++
+			progress = true
 		}
-		newTotal := atomic.AddInt64(&c.diskBytes, -size)
-		cand.diskPath = ""
-		cand.diskSize = 0
-		slog.Debug("kv cache disk pass: evicted",
-			"file", filepath.Base(path),
-			"freed_bytes", size,
-			"total_disk_bytes", newTotal)
-		// Removes the node from the trie. evictNode handles both leaves and
-		// single-child interior nodes; multi-child nodes were filtered out
-		// by the selector.
-		c.evictNode(cand)
-		evicted++
+		if !progress {
+			break
+		}
 	}
 	if evicted > 0 {
 		slog.Debug("kv cache disk pass complete",
@@ -742,58 +856,59 @@ func (c *kvCache) enforceDiskPolicy() {
 // stops the walk; the caller must handle a partial path by re-prefilling
 // the tail. Always returns nil today (errors are logged + degraded), but the
 // signature returns an error to leave room for future fail-loud modes.
-func (c *kvCache) restoreMatchedPath(path []*trieNode) error {
-	var warm, restored, gone int
+func (c *kvCache) restoreMatchedPath(path []*trieNode, matched int) error {
+	covered := 0
 	for _, node := range path {
 		if node == c.root {
 			continue
 		}
+		if covered >= matched {
+			// Remaining nodes contribute nothing to this request's matched
+			// prefix — skip the disk I/O and MLX upload.
+			break
+		}
 		if node.snapshots != nil {
-			warm++
+			covered += len(node.tokens)
 			continue // Warm or just-restored
 		}
 		if node.diskPath == "" {
-			gone++
 			slog.Debug("kv cache restore stopped at Gone node",
 				"start_offset", node.startOffset(), "tokens", len(node.tokens))
 			break
 		}
 		if err := c.loadFromDisk(node); err != nil {
-			slog.Warn("kv cache restore failed, treating as Gone",
-				"path", node.diskPath, "err", err)
+			oldPath, oldSize := node.diskPath, node.diskSize
+			slog.Warn("kv cache restore failed, deleting bad file",
+				"path", oldPath, "err", err)
+			_ = os.Remove(oldPath)
+			atomic.AddInt64(&c.diskBytes, -oldSize)
 			node.diskPath = ""
 			node.diskSize = 0
-			gone++
 			break
 		}
-		restored++
-	}
-	if restored > 0 || gone > 0 {
-		slog.Debug("kv cache restore walk", "warm", warm, "restored", restored, "gone", gone)
+		covered += len(node.tokens)
 	}
 	return nil
 }
 
-// matchedAfterRestore recomputes the number of matching tokens after a
-// partial-restore walk that may have demoted some nodes to Gone. We stop
-// counting at the first node whose snapshots are still nil and whose
-// diskPath is empty — restore failed there.
-func matchedAfterRestore(path []*trieNode, inputs []int32) int {
-	matched := 0
+// matchedAfterRestore returns how many of the `matched` input tokens are
+// actually usable after the partial-restore walk. A Gone node (snapshots nil
+// and diskPath empty) caps the usable length at the cumulative-token count
+// up to that point. Restore cannot *increase* the match count — findBestMatch
+// already determined the true prefix length against the input, so we never
+// return more than `matched`.
+func matchedAfterRestore(path []*trieNode, matched int) int {
+	covered := 0
 	for i, node := range path {
-		// Skip the root which has no tokens.
 		if i == 0 && node.parent == nil {
 			continue
 		}
 		if node.snapshots == nil && node.diskPath == "" {
-			return matched
+			return min(covered, matched)
 		}
-		matched += len(node.tokens)
-		if matched > len(inputs) {
-			return len(inputs)
-		}
+		covered += len(node.tokens)
 	}
-	return matched
+	return min(covered, matched)
 }
 
 // scheduleWrite writes node to disk synchronously (on the caller's
@@ -811,20 +926,10 @@ func (c *kvCache) scheduleWrite(node *trieNode) {
 	}
 	if len(node.snapshots) == 0 {
 		// Nothing to serialize. This can happen briefly when a Cold node is
-		// split mid-eviction; the caller is expected to repopulate snapshots
-		// (via loadFromDisk or Cache.Split) before trying again.
-		slog.Debug("kv cache scheduleWrite skipped: no snapshots",
-			"start_offset", node.startOffset(), "tokens", len(node.tokens))
+		// split mid-eviction; the caller repopulates snapshots before retrying.
 		return
 	}
 	if node.diskPath != "" {
-		slog.Debug("kv cache scheduleWrite skipped: already on disk",
-			"path", filepath.Base(node.diskPath), "tokens", len(node.tokens))
-		return
-	}
-	if node.writeAttempts >= 3 {
-		slog.Debug("kv cache scheduleWrite skipped: write permanently failed",
-			"start_offset", node.startOffset(), "attempts", node.writeAttempts)
 		return
 	}
 	c.writer.writeNode(c, node)
@@ -833,15 +938,9 @@ func (c *kvCache) scheduleWrite(node *trieNode) {
 // evictNode evicts a single node from the trie, freeing its snapshot memory.
 func (c *kvCache) evictNode(node *trieNode) {
 	if len(node.children) == 0 {
-		// Leaf: remove entirely.
-		slog.Debug("evicting leaf", "offset", node.startOffset(), "tokens", len(node.tokens), "freed", mlx.PrettyBytes(int(node.snapshotBytes())))
 		removeNode(node, &c.pagedOutBytes)
 	} else if len(node.children) == 1 {
-		// Interior node with one child: merge with child.
-		before := c.pagedOutBytes
-		tokens := len(node.tokens)
 		mergeWithChild(node, c.caches, &c.pagedOutBytes)
-		slog.Debug("evicting interior node", "offset", node.startOffset(), "tokens", tokens, "freed", mlx.PrettyBytes(int(before-c.pagedOutBytes)))
 	} else {
 		panic("evictNode called on multi-child branch point")
 	}

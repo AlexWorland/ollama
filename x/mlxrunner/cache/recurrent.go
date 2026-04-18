@@ -102,8 +102,12 @@ type recurrentSnapshot struct {
 	offset                int
 }
 
-func (s *recurrentSnapshot) Size() int { return s.convState.NumBytes() + s.deltaState.NumBytes() }
-func (s *recurrentSnapshot) Close()    { mlx.Unpin(s.convState, s.deltaState) }
+func (s *recurrentSnapshot) Size() int           { return s.convState.NumBytes() + s.deltaState.NumBytes() }
+func (s *recurrentSnapshot) Close()              { mlx.Unpin(s.convState, s.deltaState) }
+func (s *recurrentSnapshot) SnapshotType() string { return SnapshotTypeRecurrent }
+func (s *recurrentSnapshot) CollectArrays() (map[string]*mlx.Array, func()) {
+	return map[string]*mlx.Array{"conv": s.convState, "delta": s.deltaState}, func() {}
+}
 
 func (c *RecurrentCache) Snapshot(fromOffset int) Snapshot {
 	// Recurrent state is not position-sliceable — always snapshot the full state.
@@ -126,7 +130,11 @@ func (c *RecurrentCache) Restore(snapshot Snapshot, target int) bool {
 		return target == c.offset
 	}
 
-	snap := snapshot.(*recurrentSnapshot)
+	// Soft type assertion: cross-type snapshot degrades to a miss.
+	snap, ok := snapshot.(*recurrentSnapshot)
+	if !ok {
+		return false
+	}
 
 	// Recurrent snapshots encode cumulative state up to exactly
 	// snap.offset. Target must match — rewinding would leave stale

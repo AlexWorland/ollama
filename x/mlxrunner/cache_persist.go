@@ -1,5 +1,4 @@
 // Package mlxrunner — KV cache disk persistence.
-// Design: .planning/specs/2026-04-16-mlx-kv-cache-persistence-design.md
 package mlxrunner
 
 import (
@@ -12,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,9 +22,12 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
-const cacheFormatVersion = "1"
+const cacheFormatVersion = "3"
 
-// diskWriter is a thin wrapper around the cache's synchronous write path.
+// diskWriter separates circuit-breaker state from the lock-free kvCache
+// invariant. It tracks consecutive failures and trips a breaker that
+// self-heals after circuitBreakerTTL, so one transient SSD hiccup doesn't
+// disable persistence for the process lifetime.
 //
 // An earlier design ran writes on a background goroutine, but MLX's Metal
 // backend is not thread-safe: any MLX call (Eval, SaveSafetensors, etc.)
@@ -34,76 +37,66 @@ const cacheFormatVersion = "1"
 //	-[IOGPUMetalCommandBuffer validate]:215:
 //	failed assertion `commit command buffer with uncommitted encoder'
 //
-// Since the MLX runner is already single-goroutine serial (one request at
-// a time), there's no benefit to async writes — we'd just be trading one
-// sequential bottleneck (disk) for another (serialization onto a shared
-// stream). writeOne is called directly from scheduleWrite on the main
-// goroutine; the writer type is kept only as a convenient enable/disable
-// flag.
+// Since the MLX runner is single-goroutine serial, writeOne is called
+// directly from scheduleWrite on the main goroutine. diskWriter stays a
+// separate type because kvCache is intentionally mutex-free, and the
+// breaker fields do need a mutex for test-goroutine setup/teardown.
 type diskWriter struct {
 	mu                  sync.Mutex
 	disabled            bool // circuit breaker tripped (5+ consecutive failures)
 	consecutiveFailures int
+	disabledAt          time.Time // when the breaker tripped; used for TTL decay
 }
 
+// circuitBreakerTTL defines how long a tripped circuit breaker stays tripped
+// before the next write attempt resets it. A transient SSD hiccup shouldn't
+// disable persistence for the process lifetime.
+const circuitBreakerTTL = 5 * time.Minute
+
 func newDiskWriter(c *kvCache) *diskWriter {
-	slog.Debug("kv cache writer enabled (synchronous)",
-		"cache_dir", c.cacheDir, "model_digest", c.modelDigest)
 	return &diskWriter{}
 }
 
 // shutdown is a no-op in the synchronous design; there's no goroutine to
 // drain. Kept for API compatibility with the older async writer.
 func (w *diskWriter) shutdown(_ time.Duration) int {
-	slog.Debug("kv cache writer shutdown (synchronous, nothing to drain)")
 	return 0
 }
 
 // writeNode writes a single node synchronously. Must run on the same
-// goroutine that owns MLX access (the pipeline goroutine). Handles retry
-// accounting and the circuit-breaker state. Returns true on success.
+// goroutine that owns MLX access (the pipeline goroutine). Returns true on
+// success. Tracks consecutive failures and trips the circuit breaker after
+// 5 in a row; a tripped breaker self-heals after circuitBreakerTTL.
 func (w *diskWriter) writeNode(c *kvCache, node *trieNode) bool {
 	w.mu.Lock()
 	if w.disabled {
-		w.mu.Unlock()
-		slog.Debug("kv cache write skipped: writer disabled by circuit breaker",
-			"start_offset", node.startOffset())
-		return false
+		if time.Since(w.disabledAt) >= circuitBreakerTTL {
+			w.disabled = false
+			w.consecutiveFailures = 0
+		} else {
+			w.mu.Unlock()
+			return false
+		}
 	}
 	w.mu.Unlock()
 
-	startedAt := time.Now()
-	err := c.writeOne(node)
-	if err == nil {
+	if err := c.writeOne(node); err != nil {
+		slog.Warn("kv cache write failed", "err", err)
 		w.mu.Lock()
-		brokeStreak := w.consecutiveFailures > 0
-		w.consecutiveFailures = 0
-		w.mu.Unlock()
-		if brokeStreak {
-			slog.Debug("kv cache writer: failure streak broken")
+		w.consecutiveFailures++
+		if w.consecutiveFailures >= 5 {
+			slog.Warn("kv cache writer: disabling after 5 consecutive failures",
+				"ttl", circuitBreakerTTL)
+			w.disabled = true
+			w.disabledAt = time.Now()
 		}
-		slog.Debug("kv cache write completed",
-			"path", node.diskPath,
-			"size_bytes", node.diskSize,
-			"tokens", len(node.tokens),
-			"took", time.Since(startedAt).Truncate(time.Microsecond))
-		return true
+		w.mu.Unlock()
+		return false
 	}
-	node.writeAttempts++
-	slog.Warn("kv cache write failed",
-		"path", node.diskPath, "attempt", node.writeAttempts, "err", err)
 	w.mu.Lock()
-	w.consecutiveFailures++
-	failures := w.consecutiveFailures
-	if failures >= 5 {
-		slog.Warn("kv cache writer: disabling after 5 consecutive failures")
-		w.disabled = true
-	}
+	w.consecutiveFailures = 0
 	w.mu.Unlock()
-	if failures < 5 {
-		slog.Debug("kv cache writer failure streak", "consecutive", failures)
-	}
-	return false
+	return true
 }
 
 // contentFilename returns a deterministic .safetensors filename for a node.
@@ -221,18 +214,9 @@ func decodeHeader(m map[string]string) (headerFields, error) {
 	}, nil
 }
 
-// arrayExposer lets writeOne extract the underlying mlx arrays from a Snapshot
-// without depending on a concrete type. Both the test-only arraySnapshot and
-// the cache.kvSnapshot (after Task 7 adds Keys/Values) implement it.
-type arrayExposer interface {
-	Keys() *mlx.Array
-	Values() *mlx.Array
-}
-
 // writeOne serializes node's snapshots to a content-addressed file under c.cacheDir.
 // Preconditions: node is off the active path and has snapshots attached.
 // On success: node.diskPath and node.diskSize are set; c.diskBytes is incremented.
-// Synchronous; does NOT touch node.inflightWrite (that's the caller's responsibility).
 func (c *kvCache) writeOne(node *trieNode) error {
 	if c.cacheDir == "" {
 		return errors.New("writeOne called with empty cacheDir")
@@ -241,10 +225,12 @@ func (c *kvCache) writeOne(node *trieNode) error {
 		return errors.New("writeOne called with no snapshots")
 	}
 
-	arrays, fieldMap, types := collectNodeArrays(node)
-	if len(arrays) > 0 {
-		mlx.Eval(arrays...)
+	arrays, fieldMap, types, cleanup, err := collectNodeArrays(node)
+	if err != nil {
+		return fmt.Errorf("collect arrays: %w", err)
 	}
+	defer cleanup()
+	mlx.Eval(arrays...)
 
 	parentHash := ""
 	if node.parent != nil && node.parent.diskPath != "" {
@@ -260,10 +246,7 @@ func (c *kvCache) writeOne(node *trieNode) error {
 	}
 	meta := encodeHeader(h)
 
-	dtype := "unknown"
-	if len(arrays) > 0 {
-		dtype = arrays[0].DType().String()
-	}
+	dtype := arrays[0].DType().String()
 	fname := contentFilename(c.modelDigest, parentHash, node.tokens, len(node.snapshots), dtype)
 	finalPath := filepath.Join(c.cacheDir, fname)
 	// MLX's safetensors writer appends ".safetensors" if the path doesn't
@@ -304,49 +287,68 @@ func (c *kvCache) writeOne(node *trieNode) error {
 }
 
 // collectNodeArrays extracts the MLX arrays for each layer's snapshot, the
-// layer-indexed name→array map for SaveSafetensorsWithMetadata, and the
-// snapshot-type tags used by the loader to dispatch by type.
-func collectNodeArrays(node *trieNode) ([]*mlx.Array, map[string]*mlx.Array, []string) {
-	all := make([]*mlx.Array, 0, 2*len(node.snapshots))
-	fields := make(map[string]*mlx.Array, 2*len(node.snapshots))
-	types := make([]string, 0, len(node.snapshots))
+// layer-indexed name→array map for SaveSafetensorsWithMetadata, the
+// snapshot-type tags used by the loader, and a cleanup func that releases
+// any arrays snapshots allocated solely for this call (e.g. scalars packed
+// into 1-element arrays). Callers must invoke cleanup once the write
+// completes. Returns an error when any layer's snapshot is nil-mapped-to
+// non-empty type or is not a SerializableSnapshot — writing a partial file
+// with "unknown" placeholders would produce a file the loader cannot
+// restore, poisoning the cache for future startups.
+func collectNodeArrays(node *trieNode) (all []*mlx.Array, fields map[string]*mlx.Array, types []string, cleanup func(), err error) {
+	all = make([]*mlx.Array, 0, 2*len(node.snapshots))
+	fields = make(map[string]*mlx.Array, 2*len(node.snapshots))
+	types = make([]string, 0, len(node.snapshots))
+	cleanups := make([]func(), 0, len(node.snapshots))
+	cleanup = func() {
+		for _, fn := range cleanups {
+			fn()
+		}
+	}
 	for i, s := range node.snapshots {
 		if s == nil {
-			types = append(types, "unknown")
+			// A layer that legitimately has no state yet (e.g. a recurrent
+			// layer at the start of a conversation). Tag as "empty" — the
+			// loader reconstructs it as nil, and the cache's Restore() knows
+			// how to handle a nil snapshot.
+			types = append(types, cache.SnapshotTypeEmpty)
 			continue
 		}
-		if ax, ok := s.(arrayExposer); ok {
-			k, v := ax.Keys(), ax.Values()
-			fields[fmt.Sprintf("layer_%d_keys", i)] = k
-			fields[fmt.Sprintf("layer_%d_values", i)] = v
-			all = append(all, k, v)
-			types = append(types, "kv")
-			continue
+		ser, ok := s.(cache.SerializableSnapshot)
+		if !ok {
+			cleanup()
+			return nil, nil, nil, nil, fmt.Errorf("layer %d: snapshot type %T is not serializable", i, s)
 		}
-		// Unknown snapshot type: tag and skip its arrays. Task 7 will add
-		// support for the real cache.kvSnapshot via the same arrayExposer
-		// interface; until then, real-snapshot writes silently drop arrays.
-		types = append(types, "unknown")
+		st := ser.SnapshotType()
+		if _, known := cache.SnapshotFieldNames(st); !known {
+			// Guards against method-promotion surprises: a snapshot that embeds
+			// another serializable type silently inherits its SnapshotType() —
+			// which would round-trip with the wrong factory on load. Reject
+			// unregistered types at write time so the bug is loud, not latent.
+			cleanup()
+			return nil, nil, nil, nil, fmt.Errorf("layer %d: snapshot %T reports unregistered type %q", i, s, st)
+		}
+		arrs, cfn := ser.CollectArrays()
+		cleanups = append(cleanups, cfn)
+		for name, arr := range arrs {
+			fields[fmt.Sprintf("layer_%d_%s", i, name)] = arr
+			all = append(all, arr)
+		}
+		types = append(types, st)
 	}
-	return all, fields, types
+	return all, fields, types, cleanup, nil
 }
 
 // readHeader reads only the metadata block of a safetensors file without
 // loading the arrays. Used for startup rehydration and test assertions.
+// On a populated cache dir this is 10-50× faster than loading the file via
+// MLX, and avoids the MLX allocation for tensors we immediately discard.
 func (c *kvCache) readHeader(path string) (headerFields, error) {
-	sf, err := mlx.LoadSafetensorsNative(path)
+	meta, err := parseSafetensorsMetadata(path)
 	if err != nil {
 		return headerFields{}, err
 	}
-	defer sf.Free()
-	raw := make(map[string]string)
-	for _, k := range []string{
-		"cache_format_version", "model_digest", "parent_hash",
-		"tokens", "layer_count", "snapshot_types", "created_at",
-	} {
-		raw[k] = sf.GetMetadata(k)
-	}
-	return decodeHeader(raw)
+	return decodeHeader(meta)
 }
 
 // loadFromDisk reconstructs node.snapshots from node.diskPath and attaches them.
@@ -379,9 +381,9 @@ func (c *kvCache) loadFromDisk(node *trieNode) error {
 		sf.Free()
 		return fmt.Errorf("model_digest mismatch: file=%q cache=%q", h.modelDigest, c.modelDigest)
 	}
-	if h.layerCount != c.layerCount() {
+	if h.layerCount != len(c.caches) {
 		sf.Free()
-		return fmt.Errorf("layer_count mismatch: file=%d cache=%d", h.layerCount, c.layerCount())
+		return fmt.Errorf("layer_count mismatch: file=%d cache=%d", h.layerCount, len(c.caches))
 	}
 
 	startOffset := node.startOffset()
@@ -428,9 +430,6 @@ func (c *kvCache) rehydrate() error {
 	if err != nil {
 		return fmt.Errorf("readdir: %w", err)
 	}
-	slog.Debug("kv cache rehydrate scanning",
-		"cache_dir", c.cacheDir, "entries", len(entries))
-
 	// Step 1: clean tmp files (crashed writes). MLX-written tmp files end
 	// in ".tmp.safetensors"; legacy ".tmp" files (from earlier writers, or
 	// other tools) are also removed defensively.
@@ -456,15 +455,18 @@ func (c *kvCache) rehydrate() error {
 	}
 	var ok []scanned
 	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
 		name := e.Name()
 		if !strings.HasSuffix(name, ".safetensors") {
 			continue
 		}
-		path := filepath.Join(c.cacheDir, name)
-		st, err := os.Stat(path)
+		info, err := e.Info()
 		if err != nil {
 			continue
 		}
+		path := filepath.Join(c.cacheDir, name)
 		h, err := c.readHeader(path)
 		if err != nil {
 			slog.Warn("kv cache rehydrate: unreadable header, deleting", "path", path, "err", err)
@@ -476,12 +478,19 @@ func (c *kvCache) rehydrate() error {
 			// instance; skip for this rehydration.
 			continue
 		}
-		if h.layerCount != c.layerCount() {
-			slog.Warn("kv cache rehydrate: layer_count mismatch, deleting", "path", path, "file_layers", h.layerCount, "expected", c.layerCount())
+		if h.layerCount != len(c.caches) {
+			slog.Warn("kv cache rehydrate: layer_count mismatch, deleting", "path", path, "file_layers", h.layerCount, "expected", len(c.caches))
 			_ = os.Remove(path)
 			continue
 		}
-		ok = append(ok, scanned{name: name, path: path, size: st.Size(), h: h})
+		if slices.Contains(h.snapshotTypes, cache.SnapshotTypeUnknown) {
+			// Written by a pre-fix writer; the loader can't restore these and
+			// they'd poison the ancestor chain on every startup. Delete now.
+			slog.Warn("kv cache rehydrate: unloadable snapshot_types, deleting", "path", path)
+			_ = os.Remove(path)
+			continue
+		}
+		ok = append(ok, scanned{name: name, path: path, size: info.Size(), h: h})
 	}
 
 	// Step 3: index by hash, identify orphans (missing parent).
@@ -560,28 +569,40 @@ func (c *kvCache) rehydrate() error {
 	return nil
 }
 
-// restoreSnapshotArrays dispatches by snapshot_types metadata to rebuild
-// typed Snapshots from a loaded safetensors file. Unknown types are
-// treated as corrupt (per spec §10.3).
+// restoreSnapshotArrays rebuilds typed Snapshots from a loaded safetensors
+// file, dispatching by snapshot_types metadata. Field-name and type
+// dispatch live in the cache package so adding a new snapshot variant
+// doesn't require touching the persistence layer.
 func (c *kvCache) restoreSnapshotArrays(sf *mlx.SafetensorsFile, h headerFields, startOffset, endOffset int) ([]cache.Snapshot, error) {
 	snaps := make([]cache.Snapshot, h.layerCount)
 	for i := 0; i < h.layerCount; i++ {
-		st := "kv"
+		st := cache.SnapshotTypeKV
 		if i < len(h.snapshotTypes) {
 			st = h.snapshotTypes[i]
 		}
-		switch st {
-		case "kv":
-			k := sf.Get(fmt.Sprintf("layer_%d_keys", i))
-			v := sf.Get(fmt.Sprintf("layer_%d_values", i))
-			if k == nil || v == nil {
-				return nil, fmt.Errorf("layer %d: keys/values array missing", i)
-			}
-			mlx.Pin(k, v)
-			snaps[i] = cache.NewKVSnapshotFromArrays(k, v, startOffset, endOffset)
-		default:
-			return nil, fmt.Errorf("unknown snapshot type %q at layer %d", st, i)
+		names, ok := cache.SnapshotFieldNames(st)
+		if !ok {
+			return nil, fmt.Errorf("layer %d: unknown snapshot type %q", i, st)
 		}
+		fields := make(map[string]*mlx.Array, len(names))
+		pinned := make([]*mlx.Array, 0, len(names))
+		for _, name := range names {
+			full := fmt.Sprintf("layer_%d_%s", i, name)
+			arr := sf.Get(full)
+			if arr == nil {
+				mlx.Unpin(pinned...)
+				return nil, fmt.Errorf("layer %d: missing field %q", i, full)
+			}
+			mlx.Pin(arr)
+			pinned = append(pinned, arr)
+			fields[name] = arr
+		}
+		snap, err := cache.NewSnapshotFromArrays(st, fields, startOffset, endOffset)
+		if err != nil {
+			mlx.Unpin(pinned...)
+			return nil, fmt.Errorf("layer %d: %w", i, err)
+		}
+		snaps[i] = snap
 	}
 	return snaps, nil
 }

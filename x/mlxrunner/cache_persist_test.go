@@ -107,7 +107,7 @@ func TestTokensRoundTrip(t *testing.T) {
 
 func TestHeaderBuildParse(t *testing.T) {
 	h := headerFields{
-		formatVersion: "1",
+		formatVersion: "3",
 		modelDigest:   "abcdef",
 		parentHash:    "p1",
 		tokens:        []int32{5, 6, 7},
@@ -115,7 +115,7 @@ func TestHeaderBuildParse(t *testing.T) {
 		snapshotTypes: []string{"kv", "kv", "kv", "kv"},
 	}
 	meta := encodeHeader(h)
-	if meta["cache_format_version"] != "1" {
+	if meta["cache_format_version"] != "3" {
 		t.Errorf("format version missing")
 	}
 	back, err := decodeHeader(meta)
@@ -173,6 +173,78 @@ func TestWriteOneRoundTrip(t *testing.T) {
 	}
 	if h.layerCount != 1 {
 		t.Errorf("layerCount = %d, want 1", h.layerCount)
+	}
+}
+
+func TestWriteOneRefusesUnserializableSnapshot(t *testing.T) {
+	// fakeSnapshot implements cache.Snapshot but not cache.SerializableSnapshot.
+	// writeOne must refuse rather than write a file with "unknown" placeholders
+	// that the loader will reject on every subsequent startup.
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "modelX", 1)
+	defer c.teardown()
+
+	node := &trieNode{
+		tokens:    []int32{1, 2, 3},
+		parent:    c.root,
+		endOffset: c.root.endOffset + 3,
+		snapshots: []cache.Snapshot{&fakeSnapshot{byteSize: 1024}},
+	}
+	c.root.children = append(c.root.children, node)
+
+	err := c.writeOne(node)
+	if err == nil {
+		t.Fatal("writeOne should have returned error for non-exposer snapshot")
+	}
+	if !strings.Contains(err.Error(), "is not serializable") {
+		t.Errorf("error = %q, want substring 'is not serializable'", err.Error())
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Errorf("no files should be written; got %d entries", len(entries))
+	}
+	if node.diskPath != "" {
+		t.Errorf("diskPath should remain empty; got %q", node.diskPath)
+	}
+	if atomic.LoadInt64(&c.diskBytes) != 0 {
+		t.Errorf("diskBytes should remain 0; got %d", atomic.LoadInt64(&c.diskBytes))
+	}
+}
+
+func TestWriteOnePersistsNilLayerAsEmpty(t *testing.T) {
+	// Hybrid models (e.g. Mamba + transformer) may legitimately have a nil
+	// snapshot at a recurrent layer that has no state yet. The writer must
+	// tag that slot as "empty" and round-trip it back to a nil snapshot on
+	// load — not refuse to write the whole node.
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "modelY", 2)
+	defer c.teardown()
+
+	k := mlx.Zeros(mlx.DTypeFloat32, 1, 8)
+	v := mlx.Zeros(mlx.DTypeFloat32, 1, 8)
+	mlx.Pin(k, v)
+	node := &trieNode{
+		tokens:    []int32{4, 5, 6},
+		parent:    c.root,
+		endOffset: c.root.endOffset + 3,
+		// Layer 0 has real state (kv), layer 1 has none (nil — "empty").
+		snapshots: []cache.Snapshot{
+			&arraySnapshot{keys: k, values: v, size: 512},
+			nil,
+		},
+	}
+	c.root.children = append(c.root.children, node)
+
+	if err := c.writeOne(node); err != nil {
+		t.Fatalf("writeOne: %v", err)
+	}
+	h, err := c.readHeader(node.diskPath)
+	if err != nil {
+		t.Fatalf("readHeader: %v", err)
+	}
+	if len(h.snapshotTypes) != 2 || h.snapshotTypes[0] != "kv" || h.snapshotTypes[1] != "empty" {
+		t.Errorf("snapshot_types = %v, want [kv empty]", h.snapshotTypes)
 	}
 }
 
@@ -344,7 +416,7 @@ func TestRestoreMatchedPathRestoresCold(t *testing.T) {
 	}
 	node.snapshots = nil
 
-	if err := c.restoreMatchedPath([]*trieNode{node}); err != nil {
+	if err := c.restoreMatchedPath([]*trieNode{node}, len(node.tokens)); err != nil {
 		t.Fatalf("restoreMatchedPath: %v", err)
 	}
 	if len(node.snapshots) != 1 {
@@ -370,7 +442,7 @@ func TestRestoreMatchedPathStopsOnGoneAncestor(t *testing.T) {
 	n2 := &trieNode{tokens: []int32{2}, parent: n1, endOffset: n1.endOffset + 1}
 	n1.children = append(n1.children, n2)
 
-	err := c.restoreMatchedPath([]*trieNode{n1, n2})
+	err := c.restoreMatchedPath([]*trieNode{n1, n2}, len(n1.tokens)+len(n2.tokens))
 	if err != nil {
 		t.Errorf("restoreMatchedPath returned error on Gone ancestor (should degrade): %v", err)
 	}
@@ -432,6 +504,46 @@ func TestDiskPassRemovesOverCap(t *testing.T) {
 	}
 	if _, err := os.Stat(p2); err != nil {
 		t.Errorf("disk pass deleted too much: %v", err)
+	}
+}
+
+func TestRestoreMatchedPathShortCircuitsBeyondMatched(t *testing.T) {
+	// When matched covers only a prefix of the path, restoreMatchedPath
+	// should stop after restoring the nodes that contribute to matched —
+	// further disk I/O and MLX upload is pure waste.
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+	defer c.teardown()
+
+	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3, 4, 5}, 1024)
+	c.scheduleWrite(n1)
+	n2 := newTestNodeWithArraySnapshot(t, n1, []int32{6, 7, 8, 9, 10}, 1024)
+	c.scheduleWrite(n2)
+	n3 := newTestNodeWithArraySnapshot(t, n2, []int32{11, 12, 13, 14, 15}, 1024)
+	c.scheduleWrite(n3)
+	for _, n := range []*trieNode{n1, n2, n3} {
+		for _, s := range n.snapshots {
+			s.Close()
+		}
+		n.snapshots = nil
+	}
+
+	// matched=7 covers n1 entirely (5 tokens) and bisects n2 (needs full load).
+	// n3 contributes nothing and must remain Cold.
+	err := c.restoreMatchedPath([]*trieNode{c.root, n1, n2, n3}, 7)
+	if err != nil {
+		t.Fatalf("restoreMatchedPath: %v", err)
+	}
+	if n1.snapshots == nil {
+		t.Error("n1 should be restored")
+	}
+	if n2.snapshots == nil {
+		t.Error("n2 should be restored (matched bisects its edge)")
+	}
+	if n3.snapshots != nil {
+		t.Error("n3 should remain Cold (beyond matched)")
 	}
 }
 
@@ -526,6 +638,140 @@ func TestRehydrateRejectsForeignDigest(t *testing.T) {
 	}
 }
 
+func TestRehydrateRejectsUnknownSnapshotTypes(t *testing.T) {
+	// A pre-fix writer could produce a safetensors file whose snapshot_types
+	// metadata contained "unknown" — the loader rejects such files on every
+	// restore, poisoning the ancestor chain. Rehydrate must delete them.
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+
+	k := mlx.Zeros(mlx.DTypeFloat32, 1, 8)
+	v := mlx.Zeros(mlx.DTypeFloat32, 1, 8)
+	mlx.Pin(k, v)
+	defer mlx.Unpin(k, v)
+
+	h := headerFields{
+		formatVersion: cacheFormatVersion,
+		modelDigest:   "modelZ",
+		tokens:        []int32{1, 2, 3},
+		layerCount:    1,
+		snapshotTypes: []string{"unknown"},
+	}
+	meta := encodeHeader(h)
+	path := filepath.Join(dir, "bad.safetensors")
+	if err := mlx.SaveSafetensorsWithMetadata(path,
+		map[string]*mlx.Array{"layer_0_keys": k, "layer_0_values": v}, meta); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	c := newTestKvCacheWithDisk(t, dir, "modelZ", 1)
+	defer c.teardown()
+	if err := c.rehydrate(); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("rehydrate should have deleted unknown-type file; stat err = %v", err)
+	}
+	if len(c.root.children) != 0 {
+		t.Errorf("unknown-type file should not become a trie node; got %d children", len(c.root.children))
+	}
+}
+
+func TestShutdownFlushesWarmNodes(t *testing.T) {
+	// Writes are deferred from prefill to shutdown. Any Warm node with
+	// no diskPath must be persisted when shutdown runs.
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+
+	// Three Warm nodes, no disk state yet.
+	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3}, 1024)
+	n2 := newTestNodeWithArraySnapshot(t, n1, []int32{4, 5}, 1024)
+	n3 := newTestNodeWithArraySnapshot(t, n2, []int32{6, 7, 8, 9}, 1024)
+	for _, n := range []*trieNode{n1, n2, n3} {
+		if n.diskPath != "" {
+			t.Fatalf("pre-shutdown: diskPath should be empty; got %q", n.diskPath)
+		}
+	}
+
+	c.shutdown()
+
+	for i, n := range []*trieNode{n1, n2, n3} {
+		if n.diskPath == "" {
+			t.Errorf("n%d: shutdown left diskPath empty", i+1)
+		}
+		if _, err := os.Stat(n.diskPath); err != nil {
+			t.Errorf("n%d: file missing after shutdown: %v", i+1, err)
+		}
+	}
+}
+
+func TestShutdownSkipsAlreadyPersistedNodes(t *testing.T) {
+	// Nodes that already have diskPath (persisted during eviction) must
+	// not trigger redundant writes on shutdown.
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+
+	n := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3}, 1024)
+	c.scheduleWrite(n)
+	if n.diskPath == "" {
+		t.Fatal("setup failed: scheduleWrite didn't persist")
+	}
+	firstPath := n.diskPath
+	firstMtime, err := os.Stat(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.shutdown()
+
+	stat, err := os.Stat(n.diskPath)
+	if err != nil {
+		t.Fatalf("file missing after shutdown: %v", err)
+	}
+	if !stat.ModTime().Equal(firstMtime.ModTime()) {
+		t.Error("shutdown re-wrote an already-persisted node")
+	}
+}
+
+func TestShutdownBudgetFlushesNewestFirst(t *testing.T) {
+	// Under a 0-budget shutdown, no writes complete (deadline passes before
+	// the first iteration). Under an ample budget, all flush. Between, the
+	// newest-by-lastUsed wins.
+	skipIfNoMLX(t)
+	dir := t.TempDir()
+	c := newTestKvCacheWithDisk(t, dir, "model", 1)
+	c.writer = newDiskWriter(c.kvCache)
+
+	// Three nodes with distinct lastUsed times — n3 newest, n1 oldest.
+	base := time.Now()
+	n1 := newTestNodeWithArraySnapshot(t, c.root, []int32{1, 2, 3}, 1024)
+	n1.lastUsed = base.Add(-2 * time.Hour)
+	n2 := newTestNodeWithArraySnapshot(t, n1, []int32{4, 5}, 1024)
+	n2.lastUsed = base.Add(-1 * time.Hour)
+	n3 := newTestNodeWithArraySnapshot(t, n2, []int32{6, 7, 8, 9}, 1024)
+	n3.lastUsed = base
+
+	// Zero budget: nothing should flush, no error, all stay Warm.
+	c.shutdownWithBudget(0)
+	for i, n := range []*trieNode{n1, n2, n3} {
+		if n.diskPath != "" {
+			t.Errorf("0-budget shutdown unexpectedly wrote n%d", i+1)
+		}
+	}
+
+	// Ample budget: all three flush.
+	c.shutdownWithBudget(30 * time.Second)
+	for i, n := range []*trieNode{n1, n2, n3} {
+		if n.diskPath == "" {
+			t.Errorf("ample-budget shutdown left n%d unwritten", i+1)
+		}
+	}
+}
+
 func TestFeatureDisabledHasNoWriter(t *testing.T) {
 	t.Setenv("OLLAMA_KV_CACHE_DISK_MAX", "0")
 	c := newKvCache("model", 1)
@@ -576,7 +822,7 @@ func TestEndToEndWarmRestart(t *testing.T) {
 	}
 
 	// Simulate a prefix match and call restoreMatchedPath.
-	if err := sessB.restoreMatchedPath([]*trieNode{rehydrated}); err != nil {
+	if err := sessB.restoreMatchedPath([]*trieNode{rehydrated}, len(rehydrated.tokens)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	if rehydrated.snapshots == nil {

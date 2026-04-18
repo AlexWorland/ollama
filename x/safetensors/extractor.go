@@ -190,9 +190,13 @@ func OpenForExtraction(path string) (*TensorExtractor, error) {
 		f.Close()
 		return nil, fmt.Errorf("failed to read header size: %w", err)
 	}
+	if headerSize > MaxHeaderBytes {
+		f.Close()
+		return nil, fmt.Errorf("header size %d exceeds %d-byte limit", headerSize, MaxHeaderBytes)
+	}
 
 	headerBytes := make([]byte, headerSize)
-	if _, err := f.Read(headerBytes); err != nil {
+	if _, err := io.ReadFull(f, headerBytes); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("failed to read header: %w", err)
 	}

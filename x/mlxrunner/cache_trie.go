@@ -20,12 +20,10 @@ type trieNode struct {
 	snapshots []cache.Snapshot // per-layer paged-out snapshot data (nil if not paged out)
 	user      bool             // true = explicit restore point (resist auto-merge)
 
-	// Persistence fields (see .planning/specs/2026-04-16-mlx-kv-cache-persistence-design.md §5.2).
 	// Writes are synchronous on the pipeline goroutine to avoid concurrent
 	// MLX/Metal command buffer use, so there is no "in flight" state.
-	diskPath      string // "" if not persisted; content-addressed filename when set
-	diskSize      int64  // bytes on disk; 0 when diskPath == ""
-	writeAttempts uint8  // retry counter; capped at 3 (see spec §6.3)
+	diskPath string // "" if not persisted; content-addressed filename when set
+	diskSize int64  // bytes on disk; 0 when diskPath == ""
 }
 
 // startOffset returns the cumulative token offset at the start of this node's edge.
@@ -300,4 +298,26 @@ func walkNodes(root *trieNode, fn func(*trieNode) bool) {
 		return true
 	}
 	walk(root)
+}
+
+// walkDepth is walkNodes with each node's depth from start passed through.
+// Depth is computed incrementally on the recursion, avoiding parent-chain
+// walks in callers that need per-node depth during traversal.
+func walkDepth(root *trieNode, startDepth int, fn func(*trieNode, int) bool) {
+	if root == nil {
+		return
+	}
+	var walk func(*trieNode, int) bool
+	walk = func(n *trieNode, d int) bool {
+		if !fn(n, d) {
+			return false
+		}
+		for _, child := range n.children {
+			if !walk(child, d+1) {
+				return false
+			}
+		}
+		return true
+	}
+	walk(root, startDepth)
 }

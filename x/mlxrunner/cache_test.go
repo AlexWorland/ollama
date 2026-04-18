@@ -10,20 +10,18 @@ import (
 )
 
 // arraySnapshot is a Snapshot backed by real MLX arrays so persistence tests
-// can exercise the safetensors writer end-to-end. Used only by tests in
-// cache_persist_test.go; the real production type is cache.kvSnapshot.
+// can exercise the safetensors writer end-to-end.
 type arraySnapshot struct {
 	keys, values *mlx.Array
 	size         int
 }
 
-func (a *arraySnapshot) Size() int { return a.size }
-func (a *arraySnapshot) Close()    { mlx.Unpin(a.keys, a.values) }
-
-// Keys / Values mirror the accessor pair added on cache.kvSnapshot in Task 7
-// so collectNodeArrays can treat both via the same arrayExposer interface.
-func (a *arraySnapshot) Keys() *mlx.Array   { return a.keys }
-func (a *arraySnapshot) Values() *mlx.Array { return a.values }
+func (a *arraySnapshot) Size() int           { return a.size }
+func (a *arraySnapshot) Close()              { mlx.Unpin(a.keys, a.values) }
+func (a *arraySnapshot) SnapshotType() string { return cache.SnapshotTypeKV }
+func (a *arraySnapshot) CollectArrays() (map[string]*mlx.Array, func()) {
+	return map[string]*mlx.Array{"keys": a.keys, "values": a.values}, func() {}
+}
 
 // snapshotTracker records every fakeSnapshot created and every Close() call
 // so tests can detect leaked (created but never closed) or double-closed snapshots.
