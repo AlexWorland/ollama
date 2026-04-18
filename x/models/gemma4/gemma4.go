@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/model"
@@ -1013,7 +1014,14 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	return nil
 }
 
-func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
+func (m *Model) Forward(b *batch.ForwardBatch, caches []cache.Cache) *mlx.Array {
+	// gemma4 doesn't yet support multi-sequence batching (KV sharing and
+	// sliding-window masks were designed around single-seq semantics).
+	// Scheduler must gate to one sequence per call.
+	if len(b.SeqIDs) != 1 {
+		panic(fmt.Sprintf("gemma4: multi-sequence batching not supported (got %d seqs)", len(b.SeqIDs)))
+	}
+	tokens := b.InputIDs
 	dims := tokens.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	h := m.EmbedTokens.Forward(tokens)
@@ -1062,7 +1070,7 @@ func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
 		}
 
 		var donorKV *sharedKVEntry
-		h, donorKV = layer.Forward(h, c, B, L, m.TextConfig, pleInput, donorEntry, smc)
+		h, donorKV = layer.Forward(h, b, c, B, L, m.TextConfig, pleInput, donorEntry, smc)
 
 		// If this layer is a donor, store its cached KV for later shared layers.
 		if layer.IsDonor && donorKV != nil {
@@ -1188,9 +1196,9 @@ func sliceLayerDim(combined *mlx.Array, layerIdx, B, L, pleDim int32) *mlx.Array
 	return mlx.Squeeze(sliced, 2)
 }
 
-func (l *DecoderLayer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *TextConfig, pleInput *mlx.Array, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
+func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, cfg *TextConfig, pleInput *mlx.Array, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
 	normed := mlx.RMSNormFn(x, l.InputNormScaled, cfg.RMSNormEps)
-	attnOut, donorKV := l.Attention.Forward(normed, c, B, L, l.IsSliding, cfg, donorEntry, slidingMaskCache)
+	attnOut, donorKV := l.Attention.Forward(normed, b, c, B, L, l.IsSliding, cfg, donorEntry, slidingMaskCache)
 	attnOut = mlx.RMSNormFn(attnOut, l.PostAttnNormScaled, cfg.RMSNormEps)
 	h := mlx.Add(x, attnOut)
 
@@ -1238,7 +1246,7 @@ func (l *DecoderLayer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Tex
 	return h, donorKV
 }
 
-func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding bool, cfg *TextConfig, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
+func (a *Attention) Forward(x *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, isSliding bool, cfg *TextConfig, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
 	// Determine head dim and scale based on layer type.
 	headDim := cfg.HeadDim
 	scale := cfg.SlidingScale
@@ -1263,7 +1271,7 @@ func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding b
 	if donorEntry != nil {
 		offset = donorEntry.Offset - int(L)
 	} else if c != nil {
-		offset = c.Offset()
+		offset = int(c.Offsets(b.SeqIDs[0])[0])
 	}
 	var ropeFreqs *mlx.Array
 	if !isSliding {
@@ -1308,10 +1316,12 @@ func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding b
 		// Apply V norm (no learnable weight, pure RMS normalization).
 		v = mlx.RMSNormFn(v, nil, cfg.RMSNormEps)
 
-		// Update cache.
+		// Update cache. The KVHistory is ignored here: gemma4 gates to
+		// single-seq (len(b.SeqIDs)==1) in Model.Forward so its attention
+		// is always over one sequence — WithKVHistory would be a no-op.
 		if c != nil {
-			k, v = c.Update(k, v)
-			donorKV = &sharedKVEntry{K: k, V: v, Offset: c.Offset()}
+			k, v, _ = c.Update(b, k, v)
+			donorKV = &sharedKVEntry{K: k, V: v, Offset: int(c.Offsets(b.SeqIDs[0])[0])}
 		}
 	}
 
@@ -1357,7 +1367,9 @@ func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding b
 		mask := slidingMaskCache.get(L, kLen, window, q.DType())
 		out = mlx.ScaledDotProductAttentionMasked(q, k, v, scale, mask)
 	default:
-		out = mlx.ScaledDotProductAttentionCausal(q, k, v, scale, L > 1)
+		// Causal attention is the default when no mask/history option is
+		// supplied. Single-seq gemma4 doesn't need KVHistory for isolation.
+		out = mlx.ScaledDotProductAttention(q, k, v, scale)
 	}
 	out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*headDim)
 	if !mlx.MetalIsAvailable() {

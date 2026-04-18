@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/model"
@@ -87,7 +88,7 @@ type MLAAttention struct {
 }
 
 // Forward computes absorbed MLA attention output.
-func (a *MLAAttention) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
+func (a *MLAAttention) Forward(x, positions *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
 	q := a.QAProj.Forward(x)
 	q = a.QALayerNorm.Forward(q, cfg.RMSNormEps)
 	q = a.QBProj.Forward(q)
@@ -109,29 +110,28 @@ func (a *MLAAttention) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Con
 	kvLatent := a.KVALayerNorm.Forward(kvCompressed, cfg.RMSNormEps)
 	kvLatent = mlx.ExpandDims(kvLatent, 1)
 
-	offset := 0
-	if c != nil {
-		offset = c.Offset()
-	}
-	qPE = mlx.RoPEWithBase(qPE, int(cfg.QKRopeHeadDim), true, cfg.RopeTheta, 1.0, offset)
-	kPE = mlx.RoPEWithBase(kPE, int(cfg.QKRopeHeadDim), true, cfg.RopeTheta, 1.0, offset)
+	qPE = mlx.RoPEWithBase(qPE, int(cfg.QKRopeHeadDim), true, cfg.RopeTheta, 1.0, positions)
+	kPE = mlx.RoPEWithBase(kPE, int(cfg.QKRopeHeadDim), true, cfg.RopeTheta, 1.0, positions)
 
 	qLatent := a.EmbedQ.Forward(qNope)
 
 	keys := mlx.Concatenate([]*mlx.Array{kvLatent, kPE}, 3)
 
 	cachedL := L
+	var opts []mlx.SDPAOption
 	if c != nil {
 		placeholderValues := mlx.ZerosF32([]int32{B, 1, L, 0})
-		keys, _ = c.Update(keys, placeholderValues)
+		var kv mlx.KVHistory
+		keys, _, kv = c.Update(b, keys, placeholderValues)
 		cachedL = int32(keys.Dim(2))
+		opts = append(opts, mlx.WithKVHistory(kv, b.SeqLens))
 	}
 
 	values := mlx.SliceStartStop(keys, []int32{0, 0, 0, 0}, []int32{B, 1, cachedL, cfg.KVLoraRank})
 
 	queries := mlx.Concatenate([]*mlx.Array{qLatent, qPE}, 3)
 
-	out := mlx.ScaledDotProductAttentionCausal(queries, keys, values, cfg.Scale, L > 1)
+	out := mlx.ScaledDotProductAttention(queries, keys, values, cfg.Scale, opts...)
 	out = a.UnembedOut.Forward(out)
 
 	out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*cfg.VHeadDim)
@@ -309,11 +309,11 @@ type DenseBlock struct {
 }
 
 // Forward applies the dense block
-func (b *DenseBlock) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
-	r := b.Attention.Forward(b.InputLayerNorm.Forward(x, cfg.RMSNormEps), c, B, L, cfg)
+func (bl *DenseBlock) Forward(x, positions *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
+	r := bl.Attention.Forward(bl.InputLayerNorm.Forward(x, cfg.RMSNormEps), positions, b, c, B, L, cfg)
 	h := mlx.Add(x, r)
 
-	r = b.MLP.Forward(b.PostAttentionLayerNorm.Forward(h, cfg.RMSNormEps))
+	r = bl.MLP.Forward(bl.PostAttentionLayerNorm.Forward(h, cfg.RMSNormEps))
 	return mlx.Add(h, r)
 }
 
@@ -326,17 +326,17 @@ type MoEBlock struct {
 }
 
 // Forward applies the MoE block
-func (b *MoEBlock) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
-	r := b.Attention.Forward(b.InputLayerNorm.Forward(x, cfg.RMSNormEps), c, B, L, cfg)
+func (bl *MoEBlock) Forward(x, positions *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
+	r := bl.Attention.Forward(bl.InputLayerNorm.Forward(x, cfg.RMSNormEps), positions, b, c, B, L, cfg)
 	h := mlx.Add(x, r)
 
-	r = b.MoE.Forward(b.PostAttentionLayerNorm.Forward(h, cfg.RMSNormEps), cfg)
+	r = bl.MoE.Forward(bl.PostAttentionLayerNorm.Forward(h, cfg.RMSNormEps), cfg)
 	return mlx.Add(h, r)
 }
 
 // Block interface for both dense and MoE blocks
 type Block interface {
-	Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config) *mlx.Array
+	Forward(x, positions *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, cfg *Config) *mlx.Array
 }
 
 // Model represents the complete GLM4-MoE-Lite model
@@ -698,18 +698,19 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 }
 
 // Forward computes the forward pass of the model
-func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
-	dims := tokens.Dims()
+func (m *Model) Forward(b *batch.ForwardBatch, caches []cache.Cache) *mlx.Array {
+	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 
-	h := m.EmbedTokens.Forward(tokens)
+	h := m.EmbedTokens.Forward(b.InputIDs)
+	positions := batch.SequentialPositions(b, caches[0].Offsets(b.SeqIDs...))
 
 	for i, layer := range m.Layers {
 		var c cache.Cache
 		if caches != nil {
 			c = caches[i]
 		}
-		h = layer.Forward(h, c, B, L, m.Config)
+		h = layer.Forward(h, positions, b, c, B, L, m.Config)
 	}
 
 	h = m.Norm.Forward(h, m.RMSNormEps)

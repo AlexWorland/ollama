@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
@@ -66,17 +67,18 @@ func (c *fakeRewindableCache) feed(tokens []int32) {
 	c.tokens = append(c.tokens, tokens...)
 }
 
-func (c *fakeRewindableCache) Update(keys, values *mlx.Array) (*mlx.Array, *mlx.Array) {
-	return nil, nil
+func (c *fakeRewindableCache) Update(_ *batch.ForwardBatch, keys, values *mlx.Array) (*mlx.Array, *mlx.Array, mlx.KVHistory) {
+	return nil, nil, mlx.KVHistory{}
 }
-func (c *fakeRewindableCache) State() []*mlx.Array { return nil }
-func (c *fakeRewindableCache) Offset() int         { return len(c.tokens) }
+func (c *fakeRewindableCache) State() []*mlx.Array      { return nil }
+func (c *fakeRewindableCache) Offsets(_ ...int) []int32 { return []int32{int32(len(c.tokens))} }
 
 func (c *fakeRewindableCache) Free() {
 	c.tokens = nil
 }
+func (c *fakeRewindableCache) SetSeqs(seqIDs []int) {}
 
-func (c *fakeRewindableCache) Snapshot(fromOffset int) cache.Snapshot {
+func (c *fakeRewindableCache) Snapshot(seqID int, fromOffset int) cache.Snapshot {
 	if fromOffset >= len(c.tokens) {
 		return nil
 	}
@@ -93,7 +95,7 @@ func (c *fakeRewindableCache) Snapshot(fromOffset int) cache.Snapshot {
 	return s
 }
 
-func (c *fakeRewindableCache) Restore(snapshot cache.Snapshot, target int) bool {
+func (c *fakeRewindableCache) Restore(seqID int, snapshot cache.Snapshot, target int) bool {
 	if target < 0 {
 		return false
 	}
@@ -186,17 +188,18 @@ func (c *fakeSlidingWindowCache) feed(tokens []int32) {
 	c.tokens = append(c.tokens, tokens...)
 }
 
-func (c *fakeSlidingWindowCache) Update(keys, values *mlx.Array) (*mlx.Array, *mlx.Array) {
-	return nil, nil
+func (c *fakeSlidingWindowCache) Update(_ *batch.ForwardBatch, keys, values *mlx.Array) (*mlx.Array, *mlx.Array, mlx.KVHistory) {
+	return nil, nil, mlx.KVHistory{}
 }
-func (c *fakeSlidingWindowCache) State() []*mlx.Array { return nil }
-func (c *fakeSlidingWindowCache) Offset() int         { return len(c.tokens) }
+func (c *fakeSlidingWindowCache) State() []*mlx.Array      { return nil }
+func (c *fakeSlidingWindowCache) Offsets(_ ...int) []int32 { return []int32{int32(len(c.tokens))} }
 
 func (c *fakeSlidingWindowCache) Free() {
 	c.tokens = nil
 }
+func (c *fakeSlidingWindowCache) SetSeqs(seqIDs []int) {}
 
-func (c *fakeSlidingWindowCache) Snapshot(fromOffset int) cache.Snapshot {
+func (c *fakeSlidingWindowCache) Snapshot(seqID int, fromOffset int) cache.Snapshot {
 	if len(c.tokens) == 0 || len(c.tokens) <= fromOffset {
 		return nil
 	}
@@ -210,7 +213,7 @@ func (c *fakeSlidingWindowCache) Snapshot(fromOffset int) cache.Snapshot {
 	return s
 }
 
-func (c *fakeSlidingWindowCache) Restore(snapshot cache.Snapshot, target int) bool {
+func (c *fakeSlidingWindowCache) Restore(seqID int, snapshot cache.Snapshot, target int) bool {
 	if target < 0 {
 		return false
 	}
@@ -266,17 +269,18 @@ func (c *fakeRecurrentCache) feed(tokens []int32) {
 	c.tokens = append(c.tokens, tokens...)
 }
 
-func (c *fakeRecurrentCache) Update(keys, values *mlx.Array) (*mlx.Array, *mlx.Array) {
-	return nil, nil
+func (c *fakeRecurrentCache) Update(_ *batch.ForwardBatch, keys, values *mlx.Array) (*mlx.Array, *mlx.Array, mlx.KVHistory) {
+	return nil, nil, mlx.KVHistory{}
 }
-func (c *fakeRecurrentCache) State() []*mlx.Array { return nil }
-func (c *fakeRecurrentCache) Offset() int         { return len(c.tokens) }
+func (c *fakeRecurrentCache) State() []*mlx.Array      { return nil }
+func (c *fakeRecurrentCache) Offsets(_ ...int) []int32 { return []int32{int32(len(c.tokens))} }
 
 func (c *fakeRecurrentCache) Free() {
 	c.tokens = nil
 }
+func (c *fakeRecurrentCache) SetSeqs(seqIDs []int) {}
 
-func (c *fakeRecurrentCache) Snapshot(fromOffset int) cache.Snapshot {
+func (c *fakeRecurrentCache) Snapshot(seqID int, fromOffset int) cache.Snapshot {
 	// Recurrent state is cumulative; snapshot captures the full state.
 	if len(c.tokens) == 0 {
 		return nil
@@ -290,7 +294,7 @@ func (c *fakeRecurrentCache) Snapshot(fromOffset int) cache.Snapshot {
 	return s
 }
 
-func (c *fakeRecurrentCache) Restore(snapshot cache.Snapshot, target int) bool {
+func (c *fakeRecurrentCache) Restore(seqID int, snapshot cache.Snapshot, target int) bool {
 	if snapshot == nil {
 		return target == len(c.tokens) // can only no-op
 	}
@@ -380,9 +384,9 @@ func (e *testEnv) assertAllTokens(t *testing.T, label string, expected []int32) 
 	for i, c := range e.caches {
 		assertTokens(t, label, c, expected)
 		// Verify all caches report the same offset.
-		if i > 0 && c.Offset() != e.caches[0].Offset() {
+		if i > 0 && int(c.Offsets(0)[0]) != int(e.caches[0].Offsets(0)[0]) {
 			t.Errorf("%s: cache %d offset=%d != cache 0 offset=%d",
-				label, i, c.Offset(), e.caches[0].Offset())
+				label, i, int(c.Offsets(0)[0]), int(e.caches[0].Offsets(0)[0]))
 		}
 	}
 }
@@ -400,7 +404,7 @@ type requestResult struct {
 func simulateRequest(t *testing.T, kvc *kvCache, inputs, generated []int32, userSnapshotAt ...int) requestResult {
 	t.Helper()
 
-	session := kvc.begin(nil, inputs)
+	session := kvc.begin(0, nil, inputs)
 	for _, at := range userSnapshotAt {
 		if at > 0 {
 			session.requestSnapshot(at)
@@ -414,7 +418,7 @@ func simulateRequest(t *testing.T, kvc *kvCache, inputs, generated []int32, user
 
 	assertCacheOffsetAlignment(t, kvc, "after begin")
 
-	baseOffset := kvc.minCacheOffset()
+	baseOffset := kvc.seqCacheOffset(0)
 	remaining := inputs[baseOffset:]
 
 	// Prefill: feed tokens, pausing at each pending snapshot.
@@ -465,9 +469,9 @@ func assertCacheOffsetAlignment(t *testing.T, kvc *kvCache, label string) {
 	if len(kvc.caches) < 2 {
 		return
 	}
-	expected := kvc.caches[0].Offset()
+	expected := int(kvc.caches[0].Offsets(0)[0])
 	for i := 1; i < len(kvc.caches); i++ {
-		if got := kvc.caches[i].Offset(); got != expected {
+		if got := int(kvc.caches[i].Offsets(0)[0]); got != expected {
 			t.Errorf("%s: cache %d offset=%d != cache 0 offset=%d", label, i, got, expected)
 		}
 	}
@@ -760,8 +764,8 @@ func TestEvictionPreservesActiveConversations(t *testing.T) {
 		}
 
 		// Active path should be untouched.
-		if len(kvc.activePath) < 2 {
-			t.Fatalf("activePath should have >= 2 nodes, got %d", len(kvc.activePath))
+		if len(kvc.activePaths[0]) < 2 {
+			t.Fatalf("activePath should have >= 2 nodes, got %d", len(kvc.activePaths[0]))
 		}
 
 		// System prompt prefix should still be findable (multi-child
@@ -927,12 +931,12 @@ func TestLRUOnlyUpdatesUsedNodes(t *testing.T) {
 		simulateRequest(t, kvc, []int32{1, 2, 3, 6, 7, 20, 21, 30}, nil)
 
 		// The path must have enough depth to exercise intermediate nodes.
-		if len(kvc.activePath) < 3 {
-			t.Fatalf("activePath too short to test intermediate nodes: got %d nodes", len(kvc.activePath))
+		if len(kvc.activePaths[0]) < 3 {
+			t.Fatalf("activePath too short to test intermediate nodes: got %d nodes", len(kvc.activePaths[0]))
 		}
 
 		// The frontier (deepest node on the active path) must be updated.
-		frontier := kvc.activePath[len(kvc.activePath)-1]
+		frontier := kvc.activePaths[0][len(kvc.activePaths[0])-1]
 		if frontier.lastUsed.Before(beforeRequest) {
 			t.Errorf("frontier lastUsed was not updated: got %v, want >= %v",
 				frontier.lastUsed, beforeRequest)
@@ -940,7 +944,7 @@ func TestLRUOnlyUpdatesUsedNodes(t *testing.T) {
 
 		// Every non-frontier node on the active path (including root)
 		// should retain its old lastUsed — only the frontier gets refreshed.
-		for i, node := range kvc.activePath[:len(kvc.activePath)-1] {
+		for i, node := range kvc.activePaths[0][:len(kvc.activePaths[0])-1] {
 			if !node.lastUsed.Before(beforeRequest) {
 				t.Errorf("activePath[%d] (endOffset=%d) lastUsed was refreshed: got %v, want < %v",
 					i, node.endOffset, node.lastUsed, beforeRequest)

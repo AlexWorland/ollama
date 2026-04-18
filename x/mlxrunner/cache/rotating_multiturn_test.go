@@ -1,3 +1,12 @@
+//go:build legacy_singleseq_rotating
+// +build legacy_singleseq_rotating
+
+// This file tests the pre-batching single-sequence ring-buffer semantics of
+// RotatingKVCache (c.idx, c.offset, c.Update(k,v)). Those APIs were replaced
+// by the multi-sequence region model in origin/jessegross/batching. Tests are
+// preserved behind a build tag as a reference until equivalent multi-seq
+// coverage is written. See MERGE_PLAN_BATCHING.md §6 follow-ups.
+
 package cache
 
 import (

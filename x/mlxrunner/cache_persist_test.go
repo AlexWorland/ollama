@@ -870,8 +870,8 @@ func TestSplitOfColdNodeLoadsBeforeSplit(t *testing.T) {
 
 	// advancePath with tokens that partially match at index 3: [10,20,30] match,
 	// [99] diverges. This triggers splitNode on the Cold node.
-	c.activePath = []*trieNode{c.root}
-	_ = c.advancePath(c.root, []int32{10, 20, 30, 99}, 4)
+	c.activePaths = map[int][]*trieNode{0: {c.root}}
+	_ = c.advancePath(0, c.root, []int32{10, 20, 30, 99}, 4)
 
 	// After the fix: the stale file is gone, original (now suffix) has tokens
 	// [40,50] with fresh snapshots and a new diskPath, and the new intermediate
@@ -933,8 +933,8 @@ func TestSplitOfColdNodeSkipsWhenLoadFails(t *testing.T) {
 	}
 
 	before := atomic.LoadInt64(&c.diskBytes)
-	c.activePath = []*trieNode{c.root}
-	_ = c.advancePath(c.root, []int32{10, 20, 30, 99}, 4)
+	c.activePaths = map[int][]*trieNode{0: {c.root}}
+	_ = c.advancePath(0, c.root, []int32{10, 20, 30, 99}, 4)
 
 	// Load failed: node should be demoted to Gone (diskPath cleared), no
 	// intermediate created, diskBytes decremented by the failed node's size.
