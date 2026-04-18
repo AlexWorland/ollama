@@ -153,13 +153,13 @@ func loadTensorsFromManifest(root *model.Root) (map[string]*mlx.Array, error) {
 	return allTensors, nil
 }
 
-func (r *Runner) Run(host, port string, mux http.Handler) error {
-	g, ctx := errgroup.WithContext(context.Background())
+func (r *Runner) Run(ctx context.Context, host, port string, mux http.Handler) error {
+	g, gctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-gctx.Done():
 				return nil
 			case request := <-r.Requests:
 				if err := request.Pipeline(request); err != nil {
@@ -182,9 +182,25 @@ func (r *Runner) Run(host, port string, mux http.Handler) error {
 		}
 	})
 
+	server := &http.Server{
+		Addr:    net.JoinHostPort(host, port),
+		Handler: mux,
+	}
 	g.Go(func() error {
 		slog.Info("Starting HTTP server", "host", host, "port", port)
-		return http.ListenAndServe(net.JoinHostPort(host, port), mux)
+		err := server.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	})
+	g.Go(func() error {
+		<-gctx.Done()
+		// Use Background here: gctx is already cancelled, which would make
+		// Shutdown return immediately without draining in-flight requests.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
+		defer cancel()
+		return server.Shutdown(shutdownCtx)
 	})
 
 	return g.Wait()

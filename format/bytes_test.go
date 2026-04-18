@@ -52,6 +52,41 @@ func TestHumanBytes(t *testing.T) {
 	}
 }
 
+func TestParseBytes(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"", 0, true},
+		{"0", 0, false},
+		{"-1", -1, false},
+		{"-42", -42, false},
+		{"1024", 1024, false},
+		{"1K", 1024, false},
+		{"1KiB", 1024, false},
+		{"1KB", 1000, false},
+		{"50GiB", 50 * GibiByte, false},
+		{"2G", 2 * GibiByte, false},
+		{"100M", 100 * MebiByte, false},
+		{"1TiB", TebiByte, false},
+		{"1TB", TeraByte, false},
+		{"1.5G", 0, true},
+		{"abc", 0, true},
+		{"10XB", 0, true},
+	}
+	for _, c := range cases {
+		got, err := ParseBytes(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("ParseBytes(%q) err=%v wantErr=%v", c.in, err, c.wantErr)
+			continue
+		}
+		if !c.wantErr && got != c.want {
+			t.Errorf("ParseBytes(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 func TestHumanBytes2(t *testing.T) {
 	type testCase struct {
 		input    uint64

@@ -462,7 +462,4 @@ func TestTrieNodeZeroValue(t *testing.T) {
 	if n.diskSize != 0 {
 		t.Errorf("diskSize = %d, want 0", n.diskSize)
 	}
-	if n.writeAttempts != 0 {
-		t.Errorf("writeAttempts = %d, want 0", n.writeAttempts)
-	}
 }

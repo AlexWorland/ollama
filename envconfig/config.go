@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ollama/ollama/format"
 )
 
 // Host returns the scheme and host. Host can be configured via the OLLAMA_HOST environment variable.
@@ -296,62 +298,12 @@ func Uint64(key string, defaultValue uint64) func() uint64 {
 // Set aside VRAM per GPU
 var GpuOverhead = Uint64("OLLAMA_GPU_OVERHEAD", 0)
 
-// parseByteSize parses an integer byte size with an optional binary/decimal suffix.
-// Convention: bare letter (K, M, G, T) and "iB" suffix (KiB, MiB, GiB, TiB) are
-// binary (powers of 2). "B" suffix (KB, MB, GB, TB) is decimal (powers of 10).
-// A bare integer (including 0 and negatives) is returned as-is.
-// Fractional values are not supported.
-func parseByteSize(s string) (int64, error) {
-	if s == "" {
-		return 0, fmt.Errorf("empty")
-	}
-	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return n, nil
-	}
-	i := 0
-	if s[0] == '-' || s[0] == '+' {
-		i = 1
-	}
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		i++
-	}
-	if i == 0 || (i == 1 && (s[0] == '-' || s[0] == '+')) {
-		return 0, fmt.Errorf("no digits: %q", s)
-	}
-	n, err := strconv.ParseInt(s[:i], 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	var mult int64
-	switch strings.ToUpper(s[i:]) {
-	case "K", "KIB":
-		mult = 1 << 10
-	case "KB":
-		mult = 1000
-	case "M", "MIB":
-		mult = 1 << 20
-	case "MB":
-		mult = 1000 * 1000
-	case "G", "GIB":
-		mult = 1 << 30
-	case "GB":
-		mult = 1000 * 1000 * 1000
-	case "T", "TIB":
-		mult = 1 << 40
-	case "TB":
-		mult = 1000 * 1000 * 1000 * 1000
-	default:
-		return 0, fmt.Errorf("unknown suffix %q", s[i:])
-	}
-	return n * mult, nil
-}
-
 // KVCacheDiskMax returns the maximum total bytes allowed for on-disk KV cache snapshots.
 // Negative or unset: unlimited (default). Zero: persistence disabled. Positive: hard cap.
 // Accepts byte-unit suffixes (e.g. "50GiB"). Invalid values log a warning and return the default.
 func KVCacheDiskMax() int64 {
 	if s := Var("OLLAMA_KV_CACHE_DISK_MAX"); s != "" {
-		n, err := parseByteSize(s)
+		n, err := format.ParseBytes(s)
 		if err != nil {
 			slog.Warn("invalid OLLAMA_KV_CACHE_DISK_MAX, using default", "value", s, "err", err)
 			return -1

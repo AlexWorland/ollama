@@ -168,21 +168,13 @@ func Execute(args []string) error {
 		mux.Handle(source, http.RedirectHandler(target, http.StatusPermanentRedirect))
 	}
 
-	// Drain the KV cache writer queue on SIGTERM/SIGINT so the next session
-	// can rehydrate cleanly. The writer's own 15s budget bounds the wait.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		s := <-sigCh
-		slog.Info("received shutdown signal, draining kv cache writer", "signal", s)
-		runner.Shutdown()
-		// Re-raise the signal with the default disposition so the runtime
-		// exits with the expected status.
-		signal.Stop(sigCh)
-		_ = syscall.Kill(syscall.Getpid(), s.(syscall.Signal))
-	}()
+	// defer order matters: Shutdown drains the kv cache writer AFTER the
+	// HTTP server has stopped accepting requests, so no new writes race in.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	defer runner.Shutdown()
 
-	return runner.Run("127.0.0.1", strconv.Itoa(port), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return runner.Run(ctx, "127.0.0.1", strconv.Itoa(port), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		recorder := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		t := time.Now()
