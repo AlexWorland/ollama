@@ -40,11 +40,18 @@ func (s *activeSeq) cleanup() {
 
 const maxParallel = 4
 
+// decodeLogInterval throttles the per-iteration decode log. The scheduler
+// runs one decode step per generated token per active sequence; logging
+// every step overwhelms the journal under sustained load. We log the first
+// step (so "decode started" is visible) and every Nth step thereafter.
+const decodeLogInterval = 100
+
 // scheduler manages prefill and decode for all active sequences.
 type scheduler struct {
-	runner *Runner
-	active []*activeSeq
-	used   [maxParallel]bool // seqID slot allocation
+	runner    *Runner
+	active    []*activeSeq
+	used      [maxParallel]bool // seqID slot allocation
+	stepCount uint64            // monotonic decode step counter; drives decodeLogInterval
 }
 
 func (r *Runner) newScheduler() *scheduler {
@@ -318,9 +325,13 @@ func (s *scheduler) decodeStep(ctx context.Context) {
 		return
 	}
 
-	slog.Debug("scheduler: decode step",
-		"active", len(s.active),
-		"seq_ids", s.activeSeqIDs())
+	s.stepCount++
+	if s.stepCount == 1 || s.stepCount%decodeLogInterval == 0 {
+		slog.Debug("scheduler: decode step",
+			"active", len(s.active),
+			"seq_ids", s.activeSeqIDs(),
+			"step", s.stepCount)
+	}
 
 	// Read token values from previous step's samples. This forces
 	// evaluation of the lazy computation from the prior step.
