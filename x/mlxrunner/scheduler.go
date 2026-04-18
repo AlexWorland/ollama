@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -23,10 +24,11 @@ type activeSeq struct {
 	// Decode state — pinned arrays from the previous step.
 	sample, logprobs *mlx.Array
 
-	buf       bytes.Buffer
-	generated int
-	final     CompletionResponse
-	decodeAt  time.Time // set after prefill completes
+	buf        bytes.Buffer
+	generated  int
+	final      CompletionResponse
+	admittedAt time.Time // set at admitRequest entry; used to log prefill duration
+	decodeAt   time.Time // set after prefill completes
 }
 
 func (s *activeSeq) cleanup() {
@@ -54,6 +56,7 @@ func (s *scheduler) allocSeqID() int {
 	for i, used := range s.used {
 		if !used {
 			s.used[i] = true
+			slog.Debug("scheduler: allocated seq slot", "seq", i, "used", s.countUsed(), "max_parallel", maxParallel)
 			return i
 		}
 	}
@@ -63,6 +66,27 @@ func (s *scheduler) allocSeqID() int {
 // freeSeqID returns a seqID slot to the pool.
 func (s *scheduler) freeSeqID(seqID int) {
 	s.used[seqID] = false
+	slog.Debug("scheduler: freed seq slot", "seq", seqID, "used", s.countUsed(), "max_parallel", maxParallel)
+}
+
+// countUsed returns the number of currently allocated seqID slots.
+func (s *scheduler) countUsed() int {
+	n := 0
+	for _, u := range s.used {
+		if u {
+			n++
+		}
+	}
+	return n
+}
+
+// activeSeqIDs returns the seqIDs currently in the decode batch, for logging.
+func (s *scheduler) activeSeqIDs() []int {
+	ids := make([]int, len(s.active))
+	for i, a := range s.active {
+		ids[i] = a.seqID
+	}
+	return ids
 }
 
 func (s *scheduler) run(ctx context.Context) error {
@@ -78,17 +102,30 @@ func (s *scheduler) run(ctx context.Context) error {
 		mlx.DisableCompile()
 	}
 
+	slog.Info("scheduler: started", "max_parallel", maxParallel)
+	defer func() {
+		slog.Info("scheduler: stopped", "active_at_shutdown", len(s.active))
+	}()
+
 	for {
 		if len(s.active) == 0 {
-			// No active sequences — block waiting for a request.
+			// No active sequences — block waiting for a request. A free slot
+			// is guaranteed here, so admission cannot exhaust the pool.
 			select {
 			case <-ctx.Done():
 				return nil
 			case request := <-r.Requests:
 				s.admitRequest(ctx, request)
 			}
-		} else {
-			// Active sequences decoding — check for new requests non-blocking.
+			continue
+		}
+
+		// Active sequences decoding. Only poll r.Requests when a slot is
+		// free; otherwise leave pending requests queued in the channel (and
+		// blocking the HTTP handler's send) until a decode completes and
+		// frees a slot. This is the backpressure that keeps allocSeqID's
+		// pool-exhaustion sentinel from firing under bursty concurrent load.
+		if len(s.active) < maxParallel {
 			select {
 			case <-ctx.Done():
 				s.finishAll()
@@ -97,10 +134,16 @@ func (s *scheduler) run(ctx context.Context) error {
 				s.admitRequest(ctx, request)
 			default:
 			}
-
-			// Run one decode step for all active sequences.
-			s.decodeStep(ctx)
+		} else {
+			select {
+			case <-ctx.Done():
+				s.finishAll()
+				return nil
+			default:
+			}
 		}
+
+		s.decodeStep(ctx)
 	}
 }
 
@@ -110,9 +153,16 @@ func (s *scheduler) admitRequest(ctx context.Context, request Request) {
 
 	seqID := s.allocSeqID()
 
+	admitStart := time.Now()
+	slog.Info("scheduler: admitting request",
+		"seq", seqID,
+		"active_before", len(s.active),
+		"prompt_tokens", len(request.Tokens))
+
 	seq := &activeSeq{
-		seqID:   seqID,
-		request: request,
+		seqID:      seqID,
+		request:    request,
+		admittedAt: admitStart,
 		final: CompletionResponse{
 			Done:            true,
 			PromptEvalCount: len(request.Tokens),
@@ -145,6 +195,11 @@ func (s *scheduler) admitRequest(ctx context.Context, request Request) {
 	// Materialize all cache state so existing sequences' decode steps
 	// see clean buffer data (not lazy graphs from prefill/restore).
 	s.materializeCaches()
+
+	slog.Debug("scheduler: admitted",
+		"seq", seq.seqID,
+		"active_after", len(s.active)+1,
+		"prefill_ms", time.Since(admitStart).Milliseconds())
 
 	s.active = append(s.active, seq)
 }
@@ -221,6 +276,11 @@ func (s *scheduler) prefill(ctx context.Context, seq *activeSeq) error {
 	mlx.Eval(evalArrays...)
 	seq.decodeAt = time.Now()
 
+	slog.Debug("scheduler: prefill complete, first decode ready",
+		"seq", seq.seqID,
+		"prompt_tokens", len(inputs),
+		"prefill_ms", time.Since(seq.admittedAt).Milliseconds())
+
 	return nil
 }
 
@@ -257,6 +317,10 @@ func (s *scheduler) decodeStep(ctx context.Context) {
 	if len(s.active) == 0 {
 		return
 	}
+
+	slog.Debug("scheduler: decode step",
+		"active", len(s.active),
+		"seq_ids", s.activeSeqIDs())
 
 	// Read token values from previous step's samples. This forces
 	// evaluation of the lazy computation from the prior step.
@@ -334,6 +398,11 @@ func (s *scheduler) decodeStep(ctx context.Context) {
 		seq.sample, seq.logprobs = nil, nil
 	}
 
+	if slog.Default().Enabled(context.TODO(), logutil.LevelTrace) {
+		logutil.Trace(fmt.Sprintf("scheduler: forward batch seq_ids=%v seq_lens=%v total=%d",
+			seqIDs, seqLens, len(nextTokens)))
+	}
+
 	fwd := r.Model.Forward(&batch.ForwardBatch{
 		InputIDs: mlx.FromValues(nextTokens, len(nextTokens)).ExpandDims(0),
 		SeqIDs:   seqIDs,
@@ -369,7 +438,10 @@ func (s *scheduler) reapCancelled(ctx context.Context) {
 			alive = append(alive, seq)
 		}
 	}
-	if len(alive) != len(s.active) {
+	if reaped := len(s.active) - len(alive); reaped > 0 {
+		slog.Info("scheduler: reaped cancelled sequences",
+			"count", reaped,
+			"active_remaining", len(alive))
 		s.active = alive
 	}
 }
@@ -378,6 +450,22 @@ func (s *scheduler) reapCancelled(ctx context.Context) {
 // It does NOT remove from s.active — the caller is responsible for that.
 func (s *scheduler) finishSeq(seq *activeSeq) {
 	seq.final.EvalDuration = time.Since(seq.decodeAt)
+
+	reason := "max_tokens"
+	switch seq.final.DoneReason {
+	case 0:
+		reason = "eos"
+	case 1:
+		reason = "max_tokens"
+	}
+	if seq.request.Ctx.Err() != nil {
+		reason = "cancelled"
+	}
+	slog.Debug("scheduler: sequence finishing",
+		"seq", seq.seqID,
+		"reason", reason,
+		"generated", seq.generated,
+		"eval_ms", seq.final.EvalDuration.Milliseconds())
 
 	// Send final response.
 	if seq.request.Ctx.Err() == nil {
@@ -432,6 +520,9 @@ func (s *scheduler) materializeCaches() {
 	}
 	if len(state) == 0 {
 		return
+	}
+	if slog.Default().Enabled(context.TODO(), logutil.LevelTrace) {
+		logutil.Trace(fmt.Sprintf("scheduler: materialize %d cache arrays", len(state)))
 	}
 	mlx.Eval(state...)
 }
