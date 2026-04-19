@@ -172,7 +172,7 @@ type completionOpts struct {
 type CompletionResponse struct {
 	Content    string
 	Done       bool
-	DoneReason int
+	DoneReason llm.DoneReason
 
 	PromptEvalCount    int
 	PromptEvalDuration time.Duration
@@ -261,7 +261,7 @@ func (c *Client) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 		cresp := llm.CompletionResponse{
 			Content:            raw.Content,
 			Done:               raw.Done,
-			DoneReason:         llm.DoneReason(raw.DoneReason),
+			DoneReason:         raw.DoneReason,
 			PromptEvalCount:    raw.PromptEvalCount,
 			PromptEvalDuration: raw.PromptEvalDuration,
 			EvalCount:          raw.EvalCount,

@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
@@ -40,10 +40,9 @@ func (s *activeSeq) cleanup() {
 
 const maxParallel = 4
 
-// decodeLogInterval throttles the per-iteration decode log. The scheduler
-// runs one decode step per generated token per active sequence; logging
-// every step overwhelms the journal under sustained load. We log the first
-// step (so "decode started" is visible) and every Nth step thereafter.
+// decodeLogInterval throttles the per-iteration decode log. decodeStep runs
+// one batched forward pass per tick (one token per active sequence), so with
+// maxParallel=4 this logs roughly every 400 generated tokens.
 const decodeLogInterval = 100
 
 // scheduler manages prefill and decode for all active sequences.
@@ -51,7 +50,7 @@ type scheduler struct {
 	runner    *Runner
 	active    []*activeSeq
 	used      [maxParallel]bool // seqID slot allocation
-	stepCount uint64            // monotonic decode step counter; drives decodeLogInterval
+	stepCount uint64
 }
 
 func (r *Runner) newScheduler() *scheduler {
@@ -127,11 +126,10 @@ func (s *scheduler) run(ctx context.Context) error {
 			continue
 		}
 
-		// Active sequences decoding. Only poll r.Requests when a slot is
-		// free; otherwise leave pending requests queued in the channel (and
-		// blocking the HTTP handler's send) until a decode completes and
-		// frees a slot. This is the backpressure that keeps allocSeqID's
-		// pool-exhaustion sentinel from firing under bursty concurrent load.
+		// Only admit a new request when a slot is free. When at capacity,
+		// leave pending requests queued in r.Requests so HTTP handlers block
+		// in their channel send — this is the backpressure that prevents
+		// allocSeqID from ever seeing an exhausted slot pool.
 		if len(s.active) < maxParallel {
 			select {
 			case <-ctx.Done():
@@ -174,7 +172,7 @@ func (s *scheduler) admitRequest(ctx context.Context, request Request) {
 			Done:            true,
 			PromptEvalCount: len(request.Tokens),
 			EvalCount:       request.Options.MaxTokens,
-			DoneReason:      1,
+			DoneReason:      llm.DoneReasonLength,
 		},
 	}
 
@@ -326,7 +324,8 @@ func (s *scheduler) decodeStep(ctx context.Context) {
 	}
 
 	s.stepCount++
-	if s.stepCount == 1 || s.stepCount%decodeLogInterval == 0 {
+	if (s.stepCount == 1 || s.stepCount%decodeLogInterval == 0) &&
+		slog.Default().Enabled(ctx, slog.LevelDebug) {
 		slog.Debug("scheduler: decode step",
 			"active", len(s.active),
 			"seq_ids", s.activeSeqIDs(),
@@ -353,13 +352,14 @@ func (s *scheduler) decodeStep(ctx context.Context) {
 		seq.generated++
 
 		if r.Tokenizer.IsEOS(output) {
-			seq.final.DoneReason = 0
+			seq.final.DoneReason = llm.DoneReasonStop
 			seq.final.EvalCount = seq.generated - 1
 			completed = append(completed, seq)
 			continue
 		}
 
 		if seq.generated >= seq.request.Options.MaxTokens {
+			seq.final.DoneReason = llm.DoneReasonLength
 			seq.final.EvalCount = seq.generated
 			completed = append(completed, seq)
 			continue
@@ -409,9 +409,11 @@ func (s *scheduler) decodeStep(ctx context.Context) {
 		seq.sample, seq.logprobs = nil, nil
 	}
 
-	if slog.Default().Enabled(context.TODO(), logutil.LevelTrace) {
-		logutil.Trace(fmt.Sprintf("scheduler: forward batch seq_ids=%v seq_lens=%v total=%d",
-			seqIDs, seqLens, len(nextTokens)))
+	if slog.Default().Enabled(ctx, logutil.LevelTrace) {
+		logutil.Trace("scheduler: forward batch",
+			"seq_ids", seqIDs,
+			"seq_lens", seqLens,
+			"total", len(nextTokens))
 	}
 
 	fwd := r.Model.Forward(&batch.ForwardBatch{
@@ -462,13 +464,7 @@ func (s *scheduler) reapCancelled(ctx context.Context) {
 func (s *scheduler) finishSeq(seq *activeSeq) {
 	seq.final.EvalDuration = time.Since(seq.decodeAt)
 
-	reason := "max_tokens"
-	switch seq.final.DoneReason {
-	case 0:
-		reason = "eos"
-	case 1:
-		reason = "max_tokens"
-	}
+	reason := seq.final.DoneReason.String()
 	if seq.request.Ctx.Err() != nil {
 		reason = "cancelled"
 	}
@@ -532,8 +528,6 @@ func (s *scheduler) materializeCaches() {
 	if len(state) == 0 {
 		return
 	}
-	if slog.Default().Enabled(context.TODO(), logutil.LevelTrace) {
-		logutil.Trace(fmt.Sprintf("scheduler: materialize %d cache arrays", len(state)))
-	}
+	logutil.Trace("scheduler: materialize cache arrays", "count", len(state))
 	mlx.Eval(state...)
 }
