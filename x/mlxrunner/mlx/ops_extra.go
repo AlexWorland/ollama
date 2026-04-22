@@ -149,130 +149,43 @@ func Contiguous(a *Array, allowColMajor bool) *Array {
 	return out
 }
 
-// Conv2d performs 2D convolution: x [N,H,W,C_in], weight [C_out,kH,kW,C_in].
-// MLX uses NHWC layout.
-func Conv2d(x, weight *Array, strideH, strideW, padH, padW, dilationH, dilationW, groups int32) *Array {
-	out := New("CONV2D")
-	C.mlx_conv2d(
-		&out.ctx,
-		x.ctx,
-		weight.ctx,
-		C.int(strideH), C.int(strideW),
-		C.int(padH), C.int(padW),
-		C.int(dilationH), C.int(dilationW),
-		C.int(groups),
-		DefaultStream().ctx,
-	)
-	return out
-}
-
-// Pad pads array a along the given axes with specified low/high pad sizes.
-// mode should be "constant", "edge", or "reflect".
-func Pad(a *Array, axes []int, lowPad, highPad []int, padValue *Array, mode string) *Array {
-	cAxes := make([]C.int, len(axes))
-	cLow := make([]C.int, len(lowPad))
-	cHigh := make([]C.int, len(highPad))
-	for i := range axes {
-		cAxes[i] = C.int(axes[i])
-		cLow[i] = C.int(lowPad[i])
-		cHigh[i] = C.int(highPad[i])
+func Pad(a *Array, paddings []int32) *Array {
+	numAxes := len(paddings) / 2
+	axes := make([]C.int, numAxes)
+	lowPad := make([]C.int, numAxes)
+	highPad := make([]C.int, numAxes)
+	for i := range numAxes {
+		axes[i] = C.int(i)
+		lowPad[i] = C.int(paddings[i*2])
+		highPad[i] = C.int(paddings[i*2+1])
 	}
-	cMode := C.CString(mode)
+
+	padValue := C.mlx_array_new_float(C.float(0))
+	defer C.mlx_array_free(padValue)
+
+	cMode := C.CString("constant")
 	defer C.free(unsafe.Pointer(cMode))
+
 	out := New("PAD")
 	C.mlx_pad(
 		&out.ctx,
 		a.ctx,
-		unsafe.SliceData(cAxes), C.size_t(len(cAxes)),
-		unsafe.SliceData(cLow), C.size_t(len(cLow)),
-		unsafe.SliceData(cHigh), C.size_t(len(cHigh)),
-		padValue.ctx,
+		unsafe.SliceData(axes),
+		C.size_t(len(axes)),
+		unsafe.SliceData(lowPad),
+		C.size_t(len(lowPad)),
+		unsafe.SliceData(highPad),
+		C.size_t(len(highPad)),
+		padValue,
 		cMode,
 		DefaultStream().ctx,
 	)
 	return out
 }
 
-// PadConstant pads with zeros along the given axes.
-func PadConstant(a *Array, axes []int, lowPad, highPad []int) *Array {
-	zero := NewScalarArray(float32(0))
-	return Pad(a, axes, lowPad, highPad, zero, "constant")
-}
-
 func DepthwiseConv1d(x, weight *Array, bias *Array) *Array {
 	groups := int32(x.Dim(x.NumDims() - 1))
 	return Conv1d(x, weight, bias, 1, 0, 1, groups)
-}
-
-// Maximum returns element-wise maximum of two arrays.
-func Maximum(a, b *Array) *Array {
-	out := New("MAXIMUM")
-	C.mlx_maximum(&out.ctx, a.ctx, b.ctx, DefaultStream().ctx)
-	return out
-}
-
-// Minimum returns element-wise minimum of two arrays.
-func Minimum(a, b *Array) *Array {
-	out := New("MINIMUM")
-	C.mlx_minimum(&out.ctx, a.ctx, b.ctx, DefaultStream().ctx)
-	return out
-}
-
-// Softplus computes log(1 + exp(x)) using logaddexp for numerical stability.
-func Softplus(a *Array) *Array {
-	return Logaddexp(a, Zeros(a.DType(), a.Dims()...))
-}
-
-// ReLU computes max(0, x).
-func ReLU(a *Array) *Array {
-	return Maximum(a, NewScalarArray(float32(0)))
-}
-
-// GLU applies Gated Linear Unit: splits x along last dim into two halves,
-// returns first * sigmoid(second).
-func GLU(a *Array) *Array {
-	lastDim := a.NumDims() - 1
-	halfSize := a.Dim(lastDim) / 2
-	first := SliceStartStop(a,
-		make([]int32, lastDim+1), // all zeros for start
-		appendDims(a, lastDim, int32(halfSize)),
-	)
-	second := SliceStartStop(a,
-		appendDimsStart(a, lastDim, int32(halfSize)),
-		appendDims(a, lastDim, int32(a.Dim(lastDim))),
-	)
-	return first.Multiply(second.Sigmoid())
-}
-
-// helper: builds stop array for SliceStartStop where the target axis = val
-func appendDims(a *Array, targetAxis int, val int32) []int32 {
-	n := a.NumDims()
-	out := make([]int32, n)
-	for i := range n {
-		if i == targetAxis {
-			out[i] = val
-		} else {
-			out[i] = int32(a.Dim(i))
-		}
-	}
-	return out
-}
-
-// helper: builds start array for SliceStartStop where the target axis = val
-func appendDimsStart(a *Array, targetAxis int, val int32) []int32 {
-	n := a.NumDims()
-	out := make([]int32, n)
-	for i := range n {
-		if i == targetAxis {
-			out[i] = val
-		}
-	}
-	return out
-}
-
-// Clamp clamps array values to [min, max].
-func Clamp(a *Array, minVal, maxVal float32) *Array {
-	return Minimum(Maximum(a, NewScalarArray(minVal)), NewScalarArray(maxVal))
 }
 
 // Convenience wrappers (function-style for the model code)
@@ -404,41 +317,72 @@ func GatherMM(a, b *Array, lhsIndices, rhsIndices *Array, sortedIndices bool) *A
 	return a.GatherMM(b, lhsIndices, rhsIndices, sortedIndices)
 }
 
-func RoPEWithBase(x *Array, dims int, traditional bool, base, scale float32, offset int) *Array {
-	return RoPEWithFreqs(x, dims, traditional, base, scale, offset, nil)
+func SiLU(a *Array) *Array {
+	sig := a.Sigmoid()
+	return a.Multiply(sig)
 }
 
-// RoPEWithFreqs applies RoPE with optional custom frequencies.
-// When freqs is non-nil, it is used instead of computing from base.
-// Note: MLX takes reciprocal(freqs) internally to get inv_freq, so pass
-// the actual frequencies (base^(2i/dim)), not the inverse frequencies.
-func RoPEWithFreqs(x *Array, dims int, traditional bool, base, scale float32, offset int, freqs *Array) *Array {
-	var freqsCtx C.mlx_array
-	var optBase C.mlx_optional_float
-	if freqs != nil {
-		freqsCtx = freqs.ctx
-		optBase = C.mlx_optional_float{has_value: C.bool(false)}
-	} else {
-		empty := New("")
-		freqsCtx = empty.ctx
-		optBase = C.mlx_optional_float{
-			value:     C.float(base),
-			has_value: C.bool(func() bool { return base != 0 }()),
+// RoPEWithBase applies rotary position embeddings using per-token positions.
+//
+// positions is an int32 tensor of per-token absolute positions. For a single
+// sequence with contiguous positions starting at offset, this dispatches to
+// the scalar mlx_fast_rope (bit-identical to the old offset-based API).
+func RoPEWithBase(x *Array, dims int, traditional bool, base, scale float32, positions *Array) *Array {
+	posData := positions.Ints()
+	if len(posData) == 0 {
+		return x
+	}
+
+	// Fast path: single contiguous run — use scalar mlx_fast_rope
+	offset := posData[0]
+	contiguous := true
+	for i := 1; i < len(posData); i++ {
+		if posData[i] != posData[i-1]+1 {
+			contiguous = false
+			break
 		}
 	}
-	out := New("FAST_ROPE")
-	C.mlx_fast_rope(
-		&out.ctx,
-		x.ctx,
+	if contiguous {
+		freqs := New("")
+		out := New("FAST_ROPE")
+		C.mlx_fast_rope(
+			&out.ctx,
+			x.ctx,
+			C.int(dims),
+			C.bool(traditional),
+			C.mlx_optional_float{
+				value:     C.float(base),
+				has_value: C.bool(func() bool { return base != 0 }()),
+			},
+			C.float(scale),
+			C.int(offset),
+			freqs.ctx,
+			DefaultStream().ctx,
+		)
+		return out
+	}
+
+	// Multi-sequence path: use mlx_fast_rope_dynamic with per-token offsets.
+	// Transpose [1, H, L, D] → [L, H, 1, D] so L becomes batch dim,
+	// apply dynamic rope with positions [L], transpose back.
+	rotIn := Transpose(x, 2, 1, 0, 3)
+	freqs := New("")
+	rotOut := New("FAST_ROPE_DYNAMIC")
+	C.mlx_fast_rope_dynamic(
+		&rotOut.ctx,
+		rotIn.ctx,
 		C.int(dims),
 		C.bool(traditional),
-		optBase,
+		C.mlx_optional_float{
+			value:     C.float(base),
+			has_value: C.bool(func() bool { return base != 0 }()),
+		},
 		C.float(scale),
-		C.int(offset),
-		freqsCtx,
+		positions.ctx,
+		freqs.ctx,
 		DefaultStream().ctx,
 	)
-	return out
+	return Transpose(rotOut, 2, 1, 0, 3)
 }
 
 func Sigmoid(a *Array) *Array {
@@ -457,24 +401,6 @@ func Log(a *Array) *Array {
 	return out
 }
 
-func Sin(a *Array) *Array {
-	out := New("SIN")
-	C.mlx_sin(&out.ctx, a.ctx, DefaultStream().ctx)
-	return out
-}
-
-func Cos(a *Array) *Array {
-	out := New("COS")
-	C.mlx_cos(&out.ctx, a.ctx, DefaultStream().ctx)
-	return out
-}
-
-func Clip(a, aMin, aMax *Array) *Array {
-	out := New("CLIP")
-	C.mlx_clip(&out.ctx, a.ctx, aMin.ctx, aMax.ctx, DefaultStream().ctx)
-	return out
-}
-
 func Logaddexp(a, b *Array) *Array {
 	out := New("LOGADDEXP")
 	C.mlx_logaddexp(&out.ctx, a.ctx, b.ctx, DefaultStream().ctx)
@@ -487,34 +413,7 @@ func SoftmaxAxis(a *Array, axis int, precise bool) *Array {
 	return out
 }
 
-func ScaledDotProductAttentionCausal(q, k, v *Array, scale float32, causalMask bool) *Array {
-	mask := New("")
-	sinks := New("")
-	mode := ""
-	if causalMask {
-		mode = "causal"
-	}
-	cMode := C.CString(mode)
-	defer C.free(unsafe.Pointer(cMode))
 
-	out := New("FAST_SDPA")
-	C.mlx_fast_scaled_dot_product_attention(&out.ctx, q.ctx, k.ctx, v.ctx, C.float(scale), cMode, mask.ctx, sinks.ctx, DefaultStream().ctx)
-	return out
-}
-
-// ScaledDotProductAttentionMasked runs the fast SDPA kernel with an explicit
-// additive mask. The mask is broadcast to [B, H, Q, K] and added to scores
-// before softmax. Pass mode="array" so MLX actually consults mask_arr; the
-// empty string is "no mask" and silently ignores the array argument.
-func ScaledDotProductAttentionMasked(q, k, v *Array, scale float32, mask *Array) *Array {
-	sinks := New("")
-	cMode := C.CString("array")
-	defer C.free(unsafe.Pointer(cMode))
-
-	out := New("FAST_SDPA")
-	C.mlx_fast_scaled_dot_product_attention(&out.ctx, q.ctx, k.ctx, v.ctx, C.float(scale), cMode, mask.ctx, sinks.ctx, DefaultStream().ctx)
-	return out
-}
 
 func LayerNormFn(x, weight, bias *Array, eps float32) *Array {
 	out := New("FAST_LAYERNORM")

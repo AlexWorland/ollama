@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/model"
@@ -90,7 +91,8 @@ type TextConfig struct {
 // sharedKVEntry stores cached KV state from a donor layer for KV sharing.
 type sharedKVEntry struct {
 	K, V   *mlx.Array
-	Offset int // RoPE offset from donor's cache
+	Offset int          // RoPE offset from donor's cache (pre-update)
+	KV     mlx.KVHistory // Page table + seq lens from donor's cache update
 }
 
 // Attention implements Gemma 4 attention with Q/K normalization and v-norm.
@@ -1013,11 +1015,31 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	return nil
 }
 
-func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
+func (m *Model) Forward(b *batch.ForwardBatch, caches []cache.Cache) *mlx.Array {
+	tokens := b.InputIDs
 	dims := tokens.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	h := m.EmbedTokens.Forward(tokens)
 	h = mlx.MulScalar(h, m.EmbedScale)
+
+	// Compute per-token RoPE positions from the first non-nil cache's offset.
+	// All caches advance in lockstep during a single forward pass, so positions
+	// are identical for every layer. Sharing KV across layers (gemma4 KV sharing)
+	// also relies on every layer seeing the same pre-update offset.
+	var primaryCache cache.Cache
+	for _, c := range caches {
+		if c != nil {
+			primaryCache = c
+			break
+		}
+	}
+	var offsetsForPositions []int32
+	if primaryCache != nil && len(b.SeqIDs) > 0 {
+		offsetsForPositions = primaryCache.Offsets(b.SeqIDs...)
+	} else {
+		offsetsForPositions = make([]int32, len(b.SeqIDs))
+	}
+	positions := batch.SequentialPositions(b, offsetsForPositions)
 
 	// Compute PLE inputs if configured.
 	var perLayerInputs *mlx.Array
@@ -1062,7 +1084,7 @@ func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
 		}
 
 		var donorKV *sharedKVEntry
-		h, donorKV = layer.Forward(h, c, B, L, m.TextConfig, pleInput, donorEntry, smc)
+		h, donorKV = layer.Forward(h, b, positions, c, B, L, m.TextConfig, pleInput, donorEntry, smc)
 
 		// If this layer is a donor, store its cached KV for later shared layers.
 		if layer.IsDonor && donorKV != nil {
@@ -1188,9 +1210,9 @@ func sliceLayerDim(combined *mlx.Array, layerIdx, B, L, pleDim int32) *mlx.Array
 	return mlx.Squeeze(sliced, 2)
 }
 
-func (l *DecoderLayer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *TextConfig, pleInput *mlx.Array, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
+func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.ForwardBatch, positions *mlx.Array, c cache.Cache, B, L int32, cfg *TextConfig, pleInput *mlx.Array, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
 	normed := mlx.RMSNormFn(x, l.InputNormScaled, cfg.RMSNormEps)
-	attnOut, donorKV := l.Attention.Forward(normed, c, B, L, l.IsSliding, cfg, donorEntry, slidingMaskCache)
+	attnOut, donorKV := l.Attention.Forward(normed, b, positions, c, B, L, l.IsSliding, cfg, donorEntry, slidingMaskCache)
 	attnOut = mlx.RMSNormFn(attnOut, l.PostAttnNormScaled, cfg.RMSNormEps)
 	h := mlx.Add(x, attnOut)
 
@@ -1238,7 +1260,7 @@ func (l *DecoderLayer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Tex
 	return h, donorKV
 }
 
-func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding bool, cfg *TextConfig, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
+func (a *Attention) Forward(x *mlx.Array, b *batch.ForwardBatch, positions *mlx.Array, c cache.Cache, B, L int32, isSliding bool, cfg *TextConfig, donorEntry *sharedKVEntry, slidingMaskCache *slidingMaskCache) (*mlx.Array, *sharedKVEntry) {
 	// Determine head dim and scale based on layer type.
 	headDim := cfg.HeadDim
 	scale := cfg.SlidingScale
@@ -1258,26 +1280,21 @@ func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding b
 	// Apply Q norm.
 	q = mlx.RMSNormFn(q, a.QNormScaled, cfg.RMSNormEps)
 
-	// RoPE offset: use cache offset for non-shared layers, donor offset for shared.
-	offset := 0
-	if donorEntry != nil {
-		offset = donorEntry.Offset - int(L)
-	} else if c != nil {
-		offset = c.Offset()
-	}
 	var ropeFreqs *mlx.Array
 	if !isSliding {
 		ropeFreqs = cfg.FullRopeFreqs
 	}
-	q = mlx.RoPEWithFreqs(q, ropeDims, false, ropeBase, 1.0, offset, ropeFreqs)
+	q = mlx.RoPEWithFreqs(q, ropeDims, false, ropeBase, 1.0, positions, ropeFreqs)
 
 	var k, v *mlx.Array
+	var kv mlx.KVHistory
 	var donorKV *sharedKVEntry
 
 	if donorEntry != nil {
-		// Shared layer: use donor's cached K/V.
+		// Shared layer: use donor's cached K/V + KVHistory.
 		k = donorEntry.K
 		v = donorEntry.V
+		kv = donorEntry.KV
 	} else {
 		// Determine KV head count: K=V full-attention layers use NumGlobalKeyValueHeads.
 		kvHeads := cfg.NumKeyValueHeads
@@ -1303,15 +1320,22 @@ func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding b
 		k = mlx.RMSNormFn(k, a.KNormScaled, cfg.RMSNormEps)
 
 		// Apply RoPE to K.
-		k = mlx.RoPEWithFreqs(k, ropeDims, false, ropeBase, 1.0, offset, ropeFreqs)
+		k = mlx.RoPEWithFreqs(k, ropeDims, false, ropeBase, 1.0, positions, ropeFreqs)
 
 		// Apply V norm (no learnable weight, pure RMS normalization).
 		v = mlx.RMSNormFn(v, nil, cfg.RMSNormEps)
 
 		// Update cache.
 		if c != nil {
-			k, v = c.Update(k, v)
-			donorKV = &sharedKVEntry{K: k, V: v, Offset: c.Offset()}
+			k, v, kv = c.Update(b, k, v)
+			// Donor offset is the post-update position (used as seed for
+			// subsequent consumer layers via donorEntry.Offset - L).
+			postOffsets := c.Offsets(b.SeqIDs...)
+			var donorOffset int
+			if len(postOffsets) > 0 {
+				donorOffset = int(postOffsets[0])
+			}
+			donorKV = &sharedKVEntry{K: k, V: v, Offset: donorOffset, KV: kv}
 		}
 	}
 
@@ -1355,9 +1379,13 @@ func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding b
 		// subsequent sliding layer via slidingMaskCache.
 		kLen := int32(k.Dim(2))
 		mask := slidingMaskCache.get(L, kLen, window, q.DType())
-		out = mlx.ScaledDotProductAttentionMasked(q, k, v, scale, mask)
+		out = mlx.ScaledDotProductAttention(q, k, v, scale, mlx.WithMask(mask))
 	default:
-		out = mlx.ScaledDotProductAttentionCausal(q, k, v, scale, L > 1)
+		if kv.PageTable != nil {
+			out = mlx.ScaledDotProductAttention(q, k, v, scale, mlx.WithKVHistory(kv, b.SeqLens))
+		} else {
+			out = mlx.ScaledDotProductAttention(q, k, v, scale)
+		}
 	}
 	out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*headDim)
 	if !mlx.MetalIsAvailable() {

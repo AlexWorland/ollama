@@ -32,16 +32,9 @@ var (
 
 func New(name string) *Array {
 	t := &Array{name: name}
-
-	if tracing {
-		traceScratch = append(traceScratch, t)
-	} else {
-		arraysMu.Lock()
-		defer arraysMu.Unlock()
-
-		arrays = append(arrays, t)
-	}
-
+	arraysMu.Lock()
+	defer arraysMu.Unlock()
+	arrays = append(arrays, t)
 	return t
 }
 
@@ -249,9 +242,6 @@ func (t *Array) Float() float64 {
 }
 
 func (t *Array) Ints() []int {
-	if dt := t.DType(); dt != DTypeInt32 {
-		panic(fmt.Sprintf("mlx: Ints requires DTypeInt32, got %v", dt))
-	}
 	ints := make([]int, t.Size())
 	for i, f := range unsafe.Slice(C.mlx_array_data_int32(t.ctx), len(ints)) {
 		ints[i] = int(f)
@@ -260,9 +250,6 @@ func (t *Array) Ints() []int {
 }
 
 func (t *Array) Floats() []float32 {
-	if dt := t.DType(); dt != DTypeFloat32 {
-		panic(fmt.Sprintf("mlx: Floats requires DTypeFloat32, got %v", dt))
-	}
 	floats := make([]float32, t.Size())
 	for i, f := range unsafe.Slice(C.mlx_array_data_float32(t.ctx), len(floats)) {
 		floats[i] = float32(f)

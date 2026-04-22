@@ -48,7 +48,23 @@ func (r Result) Arrays() []*mlx.Array {
 	return []*mlx.Array{r.Token, r.Logprob, r.TopTokens, r.TopLogprobs}
 }
 
-func New(opts Options) *Sampler {
+// New constructs a sampler with the positional knobs the scheduler passes
+// from request options. For logprobs or full Options-struct construction,
+// use NewFromOptions.
+func New(temperature, topP, minP float32, topK, repeatLastN int, presencePenalty float32) *Sampler {
+	return NewFromOptions(Options{
+		Temperature:     temperature,
+		TopP:            topP,
+		MinP:            minP,
+		TopK:            topK,
+		RepeatLastN:     repeatLastN,
+		PresencePenalty: presencePenalty,
+	})
+}
+
+// NewFromOptions constructs a sampler with full Options, including logprobs
+// reporting flags.
+func NewFromOptions(opts Options) *Sampler {
 	if opts.RepeatPenalty <= 0 {
 		opts.RepeatPenalty = 1
 	}
@@ -145,14 +161,22 @@ func (s *Sampler) Free() {
 }
 
 // Sample runs the configured transform chain on the raw per-token logits
-// and returns the sampled token id plus, when configured, the reported
-// log-probability tensors for the selected token and the top-K tokens.
-func (s *Sampler) Sample(logits *mlx.Array) Result {
+// and returns the sampled token id. Logprobs reporting is off in this
+// fast path; callers that need logprobs must use SampleWithLogprobs.
+func (s *Sampler) Sample(logits *mlx.Array) *mlx.Array {
 	scores := logits
 	for _, transform := range s.transforms {
 		scores = transform(s, scores)
 	}
-	res := Result{Token: scores}
+	return scores
+}
+
+// SampleWithLogprobs runs the transform chain and additionally computes
+// logprob tensors when the sampler was constructed with Options.Logprobs
+// (and optionally TopLogprobs > 0).
+func (s *Sampler) SampleWithLogprobs(logits *mlx.Array) Result {
+	token := s.Sample(logits)
+	res := Result{Token: token}
 
 	if s.Logprobs {
 		// Compute log_softmax in fp32 and subtract the max before

@@ -25,15 +25,6 @@ var GELUApprox = Compile1(
 	Shapeless(),
 )
 
-// SiLU returns a * sigmoid(a) as a fused kernel.
-var SiLU = Compile1(
-	"SiLU",
-	func(a *Array) *Array {
-		return a.Multiply(a.Sigmoid())
-	},
-	Shapeless(),
-)
-
 // SwiGLU returns silu(gate) * up as a fused kernel.
 var SwiGLU = Compile2(
 	"SwiGLU",

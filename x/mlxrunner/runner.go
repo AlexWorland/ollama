@@ -2,7 +2,6 @@ package mlxrunner
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/model"
 	"github.com/ollama/ollama/x/mlxrunner/model/base"
@@ -18,35 +16,37 @@ import (
 	"github.com/ollama/ollama/x/tokenizer"
 )
 
-// Request is a short-lived struct that carries a completion request through
-// a channel from the HTTP handler to the runner goroutine. The ctx field
-// must travel with the request so that cancellation propagates across the
-// channel boundary.
 type Request struct {
-	CompletionRequest
+	TextCompletionsRequest
 	Responses chan CompletionResponse
-	Pipeline  func(context.Context, Request) error
 
-	Ctx     context.Context //nolint:containedctx
+	Ctx     context.Context
 	Tokens  []int32
 	Sampler *sample.Sampler
+}
+
+type TextCompletionsRequest struct {
+	Prompt  string `json:"prompt"`
+	Options struct {
+		Temperature     float32 `json:"temperature"`
+		TopP            float32 `json:"top_p"`
+		MinP            float32 `json:"min_p"`
+		TopK            int     `json:"top_k"`
+		RepeatLastN     int     `json:"repeat_last_n"`
+		PresencePenalty float32 `json:"presence_penalty"`
+		MaxTokens       int     `json:"max_tokens"`
+
+		// Deprecated: use MaxTokens instead
+		NumPredict int `json:"num_predict"`
+	} `json:"options"`
 }
 
 type Runner struct {
 	Model         base.Model
 	Tokenizer     *tokenizer.Tokenizer
 	Requests      chan Request
-	cache         *kvCache
+	cache         kvCache
 	contextLength int
-}
-
-// Shutdown drains the KV cache writer queue and releases its goroutine.
-// Called from the server's signal handler before exit. Safe to call when
-// persistence is disabled.
-func (r *Runner) Shutdown() {
-	if r != nil && r.cache != nil {
-		r.cache.shutdown()
-	}
 }
 
 func (r *Runner) Load(modelName string) error {
@@ -76,12 +76,6 @@ func (r *Runner) Load(modelName string) error {
 	r.Model = m
 	r.Tokenizer = m.Tokenizer()
 	r.contextLength = m.MaxContextLength()
-	// Use the model name as the digest for cache scoping. It's stable across
-	// restarts of the same model and unique enough to keep different models
-	// from cross-loading each other's snapshots.
-	r.cache = newKvCache(modelName, m.NumLayers())
-
-	mlx.EnableCompile()
 	return nil
 }
 
@@ -139,54 +133,17 @@ func loadTensorsFromManifest(root *model.Root) (map[string]*mlx.Array, error) {
 	return allTensors, nil
 }
 
-func (r *Runner) Run(ctx context.Context, host, port string, mux http.Handler) error {
-	g, gctx := errgroup.WithContext(ctx)
+func (r *Runner) Run(host, port string, mux http.Handler) error {
+	g, ctx := errgroup.WithContext(context.Background())
 
+	sched := r.newScheduler()
 	g.Go(func() error {
-		for {
-			select {
-			case <-gctx.Done():
-				return nil
-			case request := <-r.Requests:
-				if err := request.Pipeline(request.Ctx, request); err != nil {
-					slog.Info("Request terminated", "error", err)
-					var statusErr api.StatusError
-					if !errors.As(err, &statusErr) {
-						statusErr = api.StatusError{
-							StatusCode:   http.StatusInternalServerError,
-							ErrorMessage: err.Error(),
-						}
-					}
-					select {
-					case request.Responses <- CompletionResponse{Error: &statusErr}:
-					case <-request.Ctx.Done():
-					}
-				}
-
-				close(request.Responses)
-			}
-		}
+		return sched.run(ctx)
 	})
 
-	server := &http.Server{
-		Addr:    net.JoinHostPort(host, port),
-		Handler: mux,
-	}
 	g.Go(func() error {
 		slog.Info("Starting HTTP server", "host", host, "port", port)
-		err := server.ListenAndServe()
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	})
-	g.Go(func() error {
-		<-gctx.Done()
-		// Use Background here: gctx is already cancelled, which would make
-		// Shutdown return immediately without draining in-flight requests.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
-		defer cancel()
-		return server.Shutdown(shutdownCtx)
+		return http.ListenAndServe(net.JoinHostPort(host, port), mux)
 	})
 
 	return g.Wait()

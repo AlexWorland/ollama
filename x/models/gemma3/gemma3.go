@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/model"
@@ -402,11 +403,11 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	return nil
 }
 
-func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
-	dims := tokens.Dims()
+func (m *Model) Forward(b *batch.ForwardBatch, caches []cache.Cache) *mlx.Array {
+	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 
-	h := m.EmbedTokens.Forward(tokens)
+	h := m.EmbedTokens.Forward(b.InputIDs)
 	h = mlx.MulScalar(h, float32(math.Sqrt(float64(m.HiddenSize))))
 
 	for i, layer := range m.Layers {
@@ -414,7 +415,7 @@ func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
 		if caches != nil && i < len(caches) {
 			c = caches[i]
 		}
-		h = layer.Forward(h, c, B, L, m.TextConfig)
+		h = layer.Forward(h, b, c, B, L, m.TextConfig)
 	}
 
 	return mlx.RMSNormFn(h, m.NormScaled, m.RMSNormEps)
@@ -454,10 +455,10 @@ func (m *Model) FormatPrompt(prompt string) string {
 	return fmt.Sprintf("<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", prompt)
 }
 
-func (l *DecoderLayer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *TextConfig) *mlx.Array {
+func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, cfg *TextConfig) *mlx.Array {
 	normed := mlx.RMSNormFn(x, l.InputNormScaled, cfg.RMSNormEps)
 
-	attnOut := l.Attention.Forward(normed, c, B, L, l.IsSliding, cfg)
+	attnOut := l.Attention.Forward(normed, b, c, B, L, l.IsSliding, cfg)
 	attnOut = mlx.RMSNormFn(attnOut, l.PostAttnNormScaled, cfg.RMSNormEps)
 	h := mlx.Add(x, attnOut)
 
@@ -469,7 +470,7 @@ func (l *DecoderLayer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Tex
 	return mlx.Add(h, mlpOut)
 }
 
-func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding bool, cfg *TextConfig) *mlx.Array {
+func (a *Attention) Forward(x *mlx.Array, b *batch.ForwardBatch, c cache.Cache, B, L int32, isSliding bool, cfg *TextConfig) *mlx.Array {
 	q := a.QProj.Forward(x)
 	k := a.KProj.Forward(x)
 	v := a.VProj.Forward(x)
@@ -491,20 +492,18 @@ func (a *Attention) Forward(x *mlx.Array, c cache.Cache, B, L int32, isSliding b
 		ropeTheta = cfg.RopeLocalBaseFreq
 	}
 
-	offset := 0
-	if c != nil {
-		offset = c.Offset()
-	}
-	q = mlx.RoPEWithBase(q, int(cfg.HeadDim), false, ropeTheta, 1.0, offset)
-	k = mlx.RoPEWithBase(k, int(cfg.HeadDim), false, ropeTheta, 1.0, offset)
+	positions := batch.SequentialPositions(b, c.Offsets(b.SeqIDs...))
+	q = mlx.RoPEWithBase(q, int(cfg.HeadDim), false, ropeTheta, 1.0, positions)
+	k = mlx.RoPEWithBase(k, int(cfg.HeadDim), false, ropeTheta, 1.0, positions)
 
+	var opts []mlx.SDPAOption
 	if c != nil {
-		k, v = c.Update(k, v)
+		var kv mlx.KVHistory
+		k, v, kv = c.Update(b, k, v)
+		opts = append(opts, mlx.WithKVHistory(kv, b.SeqLens))
 	}
 
-	// MLX SDPA supports grouped-query attention directly (Q heads can be a
-	// multiple of K/V heads), so avoid materializing repeated K/V tensors.
-	out := mlx.ScaledDotProductAttentionCausal(q, k, v, cfg.Scale, L > 1)
+	out := mlx.ScaledDotProductAttention(q, k, v, cfg.Scale, opts...)
 	out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*cfg.HeadDim)
 	return a.OProj.Forward(out)
 }
