@@ -95,7 +95,7 @@ func Execute(args []string) error {
 		}
 
 		request.Pipeline = runner.TextGenerationPipeline
-		request.Sampler = sample.New(sample.Options{
+		request.SamplerOpts = sample.Options{
 			Temperature:      request.Options.Temperature,
 			TopP:             request.Options.TopP,
 			MinP:             request.Options.MinP,
@@ -106,7 +106,7 @@ func Execute(args []string) error {
 			FrequencyPenalty: request.Options.FrequencyPenalty,
 			Logprobs:         request.Logprobs,
 			TopLogprobs:      request.TopLogprobs,
-		})
+		}
 
 		if err := runner.Prepare(&request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
