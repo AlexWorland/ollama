@@ -152,7 +152,6 @@ type Attention interface {
 	// this layer's SDPA.
 	Update(b *batch.Batch, keys, values *mlx.Array) *nn.KVHistory
 }
-}
 
 type KVCache struct {
 	keys, values *mlx.Array
