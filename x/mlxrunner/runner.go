@@ -37,7 +37,7 @@ type Runner struct {
 	Tokenizer     *tokenizer.Tokenizer
 	Requests      chan Request
 	Sampler       *sample.Sampler
-	cache         kvCache
+	cache         *kvCache
 	contextLength int
 }
 
@@ -78,6 +78,10 @@ func (r *Runner) Load(modelName string) error {
 	r.Tokenizer = m.Tokenizer()
 	r.contextLength = m.MaxContextLength()
 	r.Sampler = sample.New(r.contextLength)
+	// Use the model name as the digest for cache scoping. It's stable across
+	// restarts of the same model and unique enough to keep different models
+	// from cross-loading each other's snapshots.
+	r.cache = newKvCache(modelName, m.NumLayers())
 
 	mlx.EnableCompile()
 	return nil
